@@ -41,17 +41,6 @@ min_J  Σ_ij |w_ij (V_ij^obs - J_i V_ij^model J_j^H)|²
 
 where `w_ij` are visibility weights and the sum is over all baselines.
 
-## Supported Jones Terms
-
-| Symbol | Name | Parameters | Averaging | Reference Constraint |
-|--------|------|------------|-----------|---------------------|
-| **K** | Delay | Delay τ per antenna, per pol | Time-averaged | τ_ref = 0 |
-| **B** | Bandpass | Complex gain per antenna, per freq, per pol | Time-averaged | ∠g_ref = 0 |
-| **G** | Gain | Complex gain per antenna, per pol | Freq-averaged | ∠g_ref = 0 |
-| **D** | Leakage | Off-diagonal terms d_xy, d_yx | Time & freq averaged | d_ref = 0 |
-| **Xf** | Crosshand phase | Phase ϕ between X-Y correlations | Time & freq averaged | None |
-| **Kcross** | Crosshand delay | Delay τ_xy between X-Y | Time-averaged | τ_xy,ref = 0 |
-
 ### Delay (K)
 
 Parameterization:
