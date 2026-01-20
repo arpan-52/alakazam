@@ -1,0 +1,214 @@
+# ALAKAZAM Calibration Pipeline Config
+# Full example with Jones chaining and application
+
+# ============================================================================
+# EXAMPLE 1: Simple calibration with automatic chaining
+# ============================================================================
+ms_files:
+  - path: /path/to/your/flux_cal.ms
+    fields: [3C147, 3C286]
+
+solve:
+  # Solve K, B, G in sequence with automatic chaining
+  - jones: [K, B, G]              # List of Jones to solve
+    ms: /path/to/your/flux_cal.ms
+    field: [3C147, 3C147, 3C147]  # Field for each Jones term
+    spw: "0:250~1800"             # SPW with channel selection
+    scans: "10~20"                # Scan range (optional)
+    ref_ant: 4                    # Reference antenna
+    phase_only: [false, false, false]  # Amp+phase for all
+    time_interval: ["inf", "inf", "10s"]  # Solint per term
+    freq_interval: ["full", "10MHz", "full"]  # Freq solint per term
+    rfi_sigma: 5.0                # RFI threshold
+    max_iter: 100
+    tol: 1e-10
+    output: flux_cal.h5           # Output table
+
+    # AUTOMATIC CHAINING:
+    # - K is solved first
+    # - B is solved with K pre-applied
+    # - G is solved with K and B pre-applied
+    # This happens automatically within the same solve entry!
+
+# ============================================================================
+# EXAMPLE 2: Advanced - Pre-apply external Jones tables
+# ============================================================================
+solve:
+  # First, solve delays on calibrator
+  - jones: [K]
+    ms: /path/to/flux_cal.ms
+    field: 3C147
+    spw: "0"
+    ref_ant: 4
+    output: k_delays.h5
+
+  # Then solve gains with delays pre-applied
+  - jones: [G]
+    ms: /path/to/flux_cal.ms
+    field: 3C147
+    spw: "0"
+    ref_ant: 4
+    output: g_gains.h5
+
+    # PRE-APPLY EXTERNAL JONES:
+    pre_apply: [K]              # Apply K delays before solving
+    pre_tables: [k_delays.h5]   # Which table to load K from
+
+  # Solve bandpass with delays AND gains pre-applied
+  - jones: [B]
+    ms: /path/to/flux_cal.ms
+    field: 3C147
+    spw: "0"
+    ref_ant: 4
+    output: bandpass.h5
+
+    # PRE-APPLY MULTIPLE JONES:
+    pre_apply: [K, G]                    # Apply K and G before solving
+    pre_tables: [k_delays.h5, g_gains.h5]  # Tables to load from
+
+# ============================================================================
+# EXAMPLE 3: Transfer calibration to target
+# ============================================================================
+apply:
+  # Apply all calibration to target MS
+  - ms: /path/to/target.ms
+    jones: [K, B, G]              # Jones to apply (order matters!)
+    tables: [flux_cal.h5]         # All in one table
+    output_col: CORRECTED_DATA    # Output column name
+
+# ============================================================================
+# EXAMPLE 4: Multi-source calibration
+# ============================================================================
+solve:
+  # Solve K delays on flux calibrator
+  - jones: [K]
+    ms: /path/to/observations.ms
+    field: 3C147
+    spw: "0:250~1800"
+    scans: "1~10"
+    ref_ant: 4
+    output: calibration.h5
+
+  # Solve gains on phase calibrator with K pre-applied
+  - jones: [G]
+    ms: /path/to/observations.ms
+    field: J1234+5678  # Phase cal
+    spw: "0:250~1800"
+    scans: "20~30"
+    ref_ant: 4
+    time_interval: "30s"  # 30-second gain solutions
+    output: calibration.h5
+    pre_apply: [K]
+    pre_tables: [calibration.h5]  # Load K from same file
+
+# ============================================================================
+# EXAMPLE 5: Real-world ASKAP-style calibration
+# ============================================================================
+solve:
+  # Step 1: Delays on flux cal
+  - jones: [K]
+    ms: 1934-638.ms  # Flux calibrator
+    field: 1934-638
+    spw: "0:250~1800"  # Avoid band edges
+    ref_ant: 4
+    output: cal_solutions.h5
+
+  # Step 2: Bandpass on flux cal (with K applied)
+  - jones: [B]
+    ms: 1934-638.ms
+    field: 1934-638
+    spw: "0:250~1800"
+    ref_ant: 4
+    freq_interval: "10MHz"  # 10 MHz chunks
+    output: cal_solutions.h5
+    pre_apply: [K]
+    pre_tables: [cal_solutions.h5]
+
+  # Step 3: Time-variable gains on phase cal (with K+B applied)
+  - jones: [G]
+    ms: phase_cal.ms
+    field: J1939-6342  # Phase cal
+    spw: "0:250~1800"
+    ref_ant: 4
+    time_interval: "10s"  # 10-second gain solutions
+    output: cal_solutions.h5
+    pre_apply: [K, B]
+    pre_tables: [cal_solutions.h5, cal_solutions.h5]
+
+# Apply everything to science target
+apply:
+  - ms: science_target.ms
+    jones: [K, B, G]  # Apply in order: K, then B, then G
+    tables: [cal_solutions.h5]
+    output_col: CORRECTED_DATA
+
+# ============================================================================
+# EXAMPLE 6: Memory-efficient chunking (auto-detected)
+# ============================================================================
+solve:
+  # Large MS - chunking auto-detected by memory check
+  - jones: [K]
+    ms: huge_observation.ms  # 50 GB MS
+    field: 3C147
+    spw: "0"  # But only SPW 0 (maybe 5 GB)
+    scans: "10"  # And only scan 10 (maybe 2 GB)
+    ref_ant: 4
+    output: cal.h5
+
+    # Pipeline will:
+    # 1. Estimate selected data: 2 GB
+    # 2. Compare to available RAM: 64 GB
+    # 3. Log: "MS size (2 GB) <= 10% RAM (6.4 GB)"
+    # 4. Decision: "Loading all data at once"
+    # 5. Clean up memory after solving
+
+# ============================================================================
+# KEY FEATURES DEMONSTRATED:
+# ============================================================================
+# 1. Automatic chaining within same solve entry
+#    - jones: [K, B, G] → K solved, then B with K applied, then G with K+B applied
+#
+# 2. Manual pre-application from external tables
+#    - pre_apply: [K]
+#    - pre_tables: [k_delays.h5]
+#
+# 3. Memory-aware loading
+#    - Estimates SELECTED data size (field/spw/scans)
+#    - Compares to 10% of available RAM
+#    - Warns if too large
+#    - Cleans up memory after each solver
+#
+# 4. Quality metrics
+#    - Auto-computed: SNR, RMSE, χ², R²
+#    - Auto-warned: SNR < 3.0
+#    - Auto-saved: In HDF5 /quality/ group
+#
+# 5. JIT acceleration
+#    - G, K, B solvers 5-10× faster
+#    - Logs: "(JIT-accelerated)"
+#
+# 6. Proper flagging
+#    - Uses np.all() + nanmean (not np.any())
+#    - K and G see consistent flagging
+
+# ============================================================================
+# USAGE:
+# ============================================================================
+# alakazam run flux_cal_config.yaml
+#
+# Output:
+#   Memory check: MS size (2.34 GB) <= 10% RAM (6.4 GB)
+#     → Loading all data at once
+#
+#   --- K on field=3C147 ---
+#   [ALAKAZAM] Chain initial guess: 21 ref baselines (JIT-accelerated)
+#   [ALAKAZAM] K solver: 7/32 working ants, 21 bl, 2048 chan, ref=4
+#
+#   Quality Metrics:
+#     SNR:             15.23
+#     RMSE:            0.0234
+#     Reduced χ²:      1.02
+#     R²:              0.95
+#
+#   Saved to flux_cal.h5
+#   Memory cleaned up

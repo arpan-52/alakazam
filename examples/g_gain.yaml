@@ -1,0 +1,42 @@
+# JACKAL G Gain Calibration Configuration
+# CLI: jackal run g_gain.yaml
+# Python: from jackal import solve_from_yaml; solve_from_yaml('g_gain.yaml')
+
+solve:
+  - jones: [G]                    # Single Jones type
+    ms: observation.ms
+
+    # Output
+    output: g_gain.h5
+
+    # Antenna & Feed
+    ref_ant: 0
+    feed_basis: linear            # or 'circular', 'auto'
+
+    # MS Selection
+    field: 3C286                  # Calibrator field
+    spw: '0'                      # First spectral window
+    scans: 1~10                   # Calibrator scans
+
+    # Solution Intervals
+    time_interval: 60s            # 60-second intervals
+    freq_interval: full           # Average all frequencies
+
+    # Column Selection
+    data_col: DATA
+    model_col: MODEL_DATA
+
+    # RFI Flagging
+    rfi_enable: true
+    rfi_threshold: 5.0
+
+    # Solver Parameters
+    max_iter: 100
+    tol: 1.0e-10
+
+    # G-specific options
+    phase_only: false             # Solve for amplitude and phase
+
+    # Pre-apply (empty for first calibration)
+    pre_apply_file: []
+    pre_apply_jones: []

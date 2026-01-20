@@ -1,0 +1,49 @@
+# JACKAL Sequential Multi-Jones Calibration
+# Demonstrates: K -> G -> B solving with automatic pre-apply chaining
+# CLI: jackal run sequential_kgb.yaml
+# Python: from jackal import solve_from_yaml; solve_from_yaml('sequential_kgb.yaml')
+
+solve:
+  - jones: [K, G, B]              # Sequential: K, then G (with K), then B (with K+G)
+    ms: observation.ms
+
+    # Output (contains all Jones solutions)
+    output: sequential_kgb.h5
+
+    # Antenna & Feed
+    ref_ant: 4
+    feed_basis: linear            # Single value -> applies to all Jones
+
+    # MS Selection
+    field: 3C286                  # Single value -> applies to all Jones
+    spw: '0'
+    scans: 1~10
+
+    # Solution Intervals (per-Jones)
+    time_interval: [inf, 60s, 60s]     # K: inf, G: 60s, B: 60s
+    freq_interval: [4MHz, full, 1MHz]  # K: 4MHz, G: full, B: 1MHz
+
+    # Column Selection
+    data_col: DATA
+    model_col: MODEL_DATA
+
+    # RFI Flagging
+    rfi_enable: true
+    rfi_threshold: 5.0
+
+    # Solver Parameters
+    max_iter: 100
+    tol: 1.0e-10
+
+    # Solver-specific options (per-Jones)
+    phase_only: [false, false, false]  # G and B: solve amp+phase
+
+    # Pre-apply (empty - no external calibration)
+    pre_apply_file: []
+    pre_apply_jones: []
+
+# Execution Flow:
+# 1. Solve K (delay) - no pre-apply
+# 2. Solve G (gain) with K pre-applied
+# 3. Solve B (bandpass) with K+G pre-applied
+# 4. Save all solutions to sequential_kgb.h5

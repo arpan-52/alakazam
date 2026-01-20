@@ -1,0 +1,67 @@
+# JACKAL Sequential Calibration with Per-Jones SPW Selection
+# Real-world example: Different SPWs and channel ranges for K, G, B
+# CLI: jackal run sequential_per_spw.yaml
+
+solve:
+  - jones: [K, G, B]
+    ms: observation.ms
+    output: calibration_multi_spw.h5
+
+    # Antenna & Feed
+    ref_ant: 4
+    feed_basis: linear
+
+    # Field
+    field: 3C147
+
+    # Different SPW+channel selections per Jones
+    # This is common when:
+    # - Different SPWs have different edge channel issues
+    # - You want wideband delay (K) but narrowband gain (G)
+    # - Bandpass (B) needs full spectral coverage
+
+    spw: ['0:250~1800', '1:120~1450', '0,1']
+    # K: SPW 0, channels 250-1800 (exclude edges for delay fit)
+    # G: SPW 1, channels 120-1450 (different SPW, different bad channels)
+    # B: SPWs 0,1, all channels (full spectral coverage for bandpass)
+
+    scans: 10
+
+    # Solution Intervals (per-Jones)
+    time_interval: [inf, 60s, 60s]
+    freq_interval: [4MHz, full, 1MHz]
+
+    # Column Selection
+    data_col: DATA
+    model_col: MODEL_DATA
+
+    # RFI Flagging
+    rfi_enable: true
+    rfi_threshold: 5.0
+
+    # Solver Parameters
+    max_iter: 100
+    tol: 1.0e-10
+
+    # Solver-specific
+    phase_only: [false, false, false]
+
+    # Pre-apply
+    pre_apply_file: []
+    pre_apply_jones: []
+
+# Execution Flow:
+# 1. Solve K on SPW 0, channels 250-1800
+# 2. Solve G on SPW 1, channels 120-1450 (with K pre-applied)
+# 3. Solve B on SPWs 0,1, all channels (with K+G pre-applied)
+#
+# Common Use Cases:
+# - Edge channels vary per SPW due to different filters
+# - L-band: SPW 0 might have RFI at low freq, SPW 1 at high freq
+# - VLA: Different subbands have different edge effects
+# - ALMA: Different basebands have different passband shapes
+
+# CASA-style Selection Examples:
+# spw: ['0:100~1900', '1:150~1850', '0~1']        # Ranges
+# spw: ['0:500~1500', '1', '0,1,2']                # Mixed
+# spw: ['0:200~1800', '1:300~1700', '0~3:50~2000'] # All SPWs with same channels

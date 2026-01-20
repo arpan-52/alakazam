@@ -1,0 +1,52 @@
+# JACKAL K Delay Calibration with Channel Selection
+# Demonstrates excluding edge channels for better delay fits
+# CLI: jackal run k_delay_chansel.yaml
+# Python: from jackal import solve_from_yaml; solve_from_yaml('k_delay_chansel.yaml')
+
+solve:
+  - jones: [K]                    # Delay calibration
+    ms: observation.ms
+
+    # Output
+    output: k_delay_chansel.h5
+
+    # Antenna & Feed
+    ref_ant: 0
+    feed_basis: linear
+
+    # MS Selection with channel exclusion
+    field: 3C286
+    spw: '0:250~1800'             # SPW 0, channels 250-1800
+                                   # Excludes first 250 and last ~200 edge channels
+                                   # Edge channels often have RFI and poor response
+    scans: '1~10'                 # Calibrator scans
+
+    # Solution Intervals
+    time_interval: inf            # One solution per scan
+    freq_interval: 4MHz           # 4 MHz frequency intervals
+
+    # Column Selection
+    data_col: DATA
+    model_col: MODEL_DATA
+
+    # RFI Flagging
+    rfi_enable: true
+    rfi_threshold: 5.0
+
+    # Solver Parameters
+    max_iter: 100
+    tol: 1.0e-10
+
+    # Pre-apply
+    pre_apply_file: []
+    pre_apply_jones: []
+
+# Notes:
+# - Edge channel exclusion improves delay fits by removing channels with:
+#   * Bandpass edge effects
+#   * RFI (especially at band edges)
+#   * Poor receiver response
+# - Common channel ranges for 2048-channel data:
+#   * Conservative: 0:256~1792  (middle 1536 channels)
+#   * Moderate:     0:128~1920  (middle 1792 channels)
+#   * Minimal:      0:64~1984   (middle 1920 channels)
