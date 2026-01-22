@@ -20,6 +20,7 @@ from typing import Dict, Optional
 import logging
 
 from .base import JonesEffect, JonesMetadata, JonesTypeEnum, SolveResult
+from ..core.initialization import compute_initial_jones_chain, normalize_jones_to_reference
 
 logger = logging.getLogger('jackal')
 
@@ -265,14 +266,17 @@ class GainDiagonal(JonesEffect):
                 flagging_stats={}
             )
 
-        # Chain solve initial guess
-        logger.info("  Computing initial guess from chain solver...")
-        gains_init = _chain_solve_diagonal(vis_obs_filt, vis_model_filt, ant1_filt, ant2_filt, n_ant, ref_ant)
+        # Compute initial guess using direct chain method
+        logger.info("  Computing initial guess from direct chain method...")
+        jones_init = compute_initial_jones_chain(
+            vis_obs_filt, vis_model_filt, ant1_filt, ant2_filt,
+            n_ant, ref_ant=ref_ant, flags=None, verbose=False
+        )
 
-        # Build Jones and extract params
-        jones_init = np.zeros((n_ant, 2, 2), dtype=np.complex128)
-        jones_init[:, 0, 0] = gains_init[:, 0]
-        jones_init[:, 1, 1] = gains_init[:, 1]
+        # Normalize to reference antenna constraint
+        jones_init = normalize_jones_to_reference(jones_init, ref_ant, phase_only=phase_only)
+
+        # Extract params for optimizer
         p0 = _diag_jones_to_params(jones_init, ref_ant, working_ants, phase_only)
 
         # Optimize

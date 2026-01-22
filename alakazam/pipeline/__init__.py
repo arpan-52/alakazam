@@ -24,7 +24,8 @@ except ImportError:
     import logging
 
 from ..core import solve
-from ..core.interpolation import interpolate_jones_freq, interpolate_jones_time_array
+from ..core.interpolation import interpolate_jones_freq, interpolate_jones_time_array, fill_flagged_from_valid
+from ..core.fluxscale import compute_fluxscale, compute_fluxscale_multi_field
 from ..core.solint import (
     parse_time_interval,
     parse_freq_interval,
@@ -289,11 +290,83 @@ def format_spw_string(spw: Optional[str], spw_id: int) -> str:
 # MS Reading (casacore)
 # =============================================================================
 
+def get_ms_time_array(
+    ms_path: str,
+    field: str = None,
+    spw: str = None,
+    scans: str = None,
+) -> np.ndarray:
+    """
+    Read just the TIME column from MS (lightweight operation).
+    Used for pre-computing time chunks before batched loading.
+    """
+    from casacore.tables import table, taql
+
+    ms = table(ms_path, readonly=True, ack=False)
+
+    # Build TaQL selection (same logic as read_ms)
+    conditions = []
+
+    if field is not None:
+        field_tab = table(f"{ms_path}::FIELD", readonly=True, ack=False)
+        field_names = list(field_tab.getcol("NAME"))
+        field_tab.close()
+
+        if field in field_names:
+            field_id = field_names.index(field)
+            conditions.append(f"FIELD_ID=={field_id}")
+        else:
+            raise ValueError(f"Field '{field}' not found. Available: {field_names}")
+
+    if spw is not None:
+        spw = str(spw)
+        # Parse SPW (ignore channel selection for time array)
+        if ":" in spw:
+            spw_part = spw.split(":", 1)[0]
+        else:
+            spw_part = spw
+
+        if "~" in spw_part:
+            start, end = spw_part.split("~")
+            spw_ids = list(range(int(start), int(end) + 1))
+        elif "," in spw_part:
+            spw_ids = [int(s.strip()) for s in spw_part.split(",")]
+        else:
+            spw_ids = [int(spw_part)]
+        conditions.append(f"DATA_DESC_ID IN [{','.join(map(str, spw_ids))}]")
+
+    if scans is not None:
+        scans = str(scans)
+        if "~" in scans:
+            start, end = scans.split("~")
+            scan_ids = list(range(int(start), int(end) + 1))
+        elif "," in scans:
+            scan_ids = [int(s.strip()) for s in scans.split(",")]
+        else:
+            scan_ids = [int(scans)]
+        conditions.append(f"SCAN_NUMBER IN [{','.join(map(str, scan_ids))}]")
+
+    # Select and read only TIME column
+    if conditions:
+        query = f"SELECT TIME FROM $ms WHERE {' AND '.join(conditions)}"
+        sel = taql(query)
+    else:
+        sel = ms
+
+    time_arr = sel.getcol("TIME")
+    sel.close()
+    ms.close()
+
+    return time_arr
+
+
 def read_ms(
     ms_path: str,
     field: str = None,
     spw: str = None,
     scans: str = None,
+    time_min: float = None,
+    time_max: float = None,
     data_col: str = "DATA",
     model_col: str = "MODEL_DATA",
 ) -> Dict[str, Any]:
@@ -383,14 +456,30 @@ def read_ms(
         else:
             scan_ids = [int(scans)]
         conditions.append(f"SCAN_NUMBER IN [{','.join(map(str, scan_ids))}]")
-    
+
+    if time_min is not None:
+        conditions.append(f"TIME >= {time_min}")
+
+    if time_max is not None:
+        conditions.append(f"TIME <= {time_max}")  # Inclusive upper bound
+
     # Select data
     if conditions:
         query = f"SELECT * FROM $ms WHERE {' AND '.join(conditions)}"
         sel = taql(query)
     else:
         sel = ms
-    
+
+    # Check if selection is empty
+    if sel.nrows() == 0:
+        sel.close()
+        ms.close()
+        raise ValueError(
+            f"No data found for selection. "
+            f"Field: {field}, SPW: {spw}, Scans: {scans}, "
+            f"Time range: [{time_min}, {time_max}]"
+        )
+
     # Read columns
     antenna1 = sel.getcol("ANTENNA1").astype(np.int32)
     antenna2 = sel.getcol("ANTENNA2").astype(np.int32)
@@ -545,6 +634,16 @@ def write_corrected(
         jones_loaded = data['jones']
         freq_loaded = data.get('freq', None)
         time_loaded = data.get('time', None)
+        weights_loaded = data.get('weights', None)
+
+        # Check weights and warn if any chunks are flagged
+        if weights_loaded is not None:
+            n_flagged = np.sum(weights_loaded == 0.0)
+            if n_flagged > 0 and verbose:
+                if RICH_AVAILABLE and console:
+                    console.print(f"      [yellow]Warning: {n_flagged} of {weights_loaded.size} chunks have weight=0 (flagged)[/yellow]")
+                else:
+                    print(f"    Warning: {n_flagged} of {weights_loaded.size} chunks have weight=0 (flagged)")
 
         # Get shape info
         if verbose:
@@ -590,6 +689,56 @@ def write_corrected(
 
         else:
             raise ValueError(f"Unexpected Jones shape: {jones_loaded.shape}")
+
+        # Fill flagged chunks by interpolating from valid neighbors (weight-aware)
+        if weights_loaded is not None and jones_work is not None:
+            n_flagged = np.sum(weights_loaded == 0.0)
+            if n_flagged > 0:
+                # Need to reshape to 5D for fill_flagged_from_valid
+                jones_reshaped = None
+                weights_reshaped = None
+
+                if jones_work.ndim == 5:
+                    # (n_time, n_freq, n_ant, 2, 2) - already 5D
+                    jones_reshaped = jones_work
+                    weights_reshaped = weights_loaded
+                elif jones_work.ndim == 4:
+                    if is_time_dependent and not is_freq_dependent:
+                        # (n_time, n_ant, 2, 2) → (n_time, 1, n_ant, 2, 2)
+                        jones_reshaped = jones_work[:, np.newaxis, :, :, :]
+                        weights_reshaped = weights_loaded[:, :1]  # (n_time, 1)
+                    elif is_freq_dependent and not is_time_dependent:
+                        # (n_freq, n_ant, 2, 2) → (1, n_freq, n_ant, 2, 2)
+                        jones_reshaped = jones_work[np.newaxis, :, :, :, :]
+                        weights_reshaped = weights_loaded[:1, :]  # (1, n_freq)
+                elif jones_work.ndim == 3:
+                    # (n_ant, 2, 2) → (1, 1, n_ant, 2, 2) - no interpolation needed
+                    jones_reshaped = None
+
+                if jones_reshaped is not None:
+                    # Fill flagged chunks by interpolating from valid neighbors
+                    jones_filled = fill_flagged_from_valid(
+                        jones_reshaped,
+                        weights_reshaped,
+                        time=time_loaded if is_time_dependent else None,
+                        freq=freq_loaded if is_freq_dependent else None,
+                        method='linear'
+                    )
+
+                    # Reshape back to original shape
+                    if jones_work.ndim == 5:
+                        jones_work = jones_filled
+                    elif jones_work.ndim == 4:
+                        if is_time_dependent and not is_freq_dependent:
+                            jones_work = jones_filled[:, 0, :, :, :]
+                        elif is_freq_dependent and not is_time_dependent:
+                            jones_work = jones_filled[0, :, :, :, :]
+
+                    if verbose:
+                        if RICH_AVAILABLE and console:
+                            console.print(f"      [yellow]Filled {n_flagged} flagged chunks by interpolation[/yellow]")
+                        else:
+                            print(f"    Filled {n_flagged} flagged chunks by interpolation")
 
         # Interpolate in TIME if needed
         if is_time_dependent:
@@ -773,6 +922,114 @@ def expand_list(value, n: int) -> List:
 
 
 # =============================================================================
+# Parallel Chunk Solving with Shared Memory
+# =============================================================================
+
+# Global batch data for workers (set before Pool creation, shared via fork)
+_batch_data = {}
+
+def _solve_chunk_worker(args):
+    """
+    Worker function for parallel chunk solving with shared memory.
+
+    Uses global _batch_data to access large arrays without copying.
+    Only small parameters are passed via args.
+
+    Returns: (t_idx, f_idx, jones_chunk, params_chunk, info_chunk, weight)
+        weight: 1.0 if solve succeeded, 0.0 if failed/empty
+    """
+    (
+        t_idx, f_idx, t_start_chunk, t_end_chunk, freq_chunk_indices,
+        jt, n_ant_working, ref_ant, phase_only,
+        rfi_sigma, max_iter, tol
+    ) = args
+
+    # Access batch data from global (no copy, shared via fork)
+    vis_obs_batch = _batch_data['vis_obs']
+    vis_model_batch = _batch_data['vis_model']
+    flags_batch = _batch_data['flags']
+    antenna1_batch_remapped = _batch_data['antenna1_remapped']
+    antenna2_batch_remapped = _batch_data['antenna2_remapped']
+    time_arr_batch = _batch_data['time']
+    freq = _batch_data['freq']
+    pre_jones_list = _batch_data['pre_jones_list']
+
+    # Filter batch data to this time chunk
+    time_mask = (time_arr_batch >= t_start_chunk) & (time_arr_batch <= t_end_chunk)
+    time_chunk_indices = np.where(time_mask)[0]
+
+    # Check for empty chunk
+    if len(time_chunk_indices) == 0:
+        jones_empty = np.zeros((n_ant_working, 2, 2), dtype=np.complex128)
+        return (t_idx, f_idx, jones_empty, None, {'cost_init': 0.0, 'cost_final': 0.0, 'nfev': 0}, 0.0)
+
+    # Extract chunk data
+    vis_obs_chunk, vis_model_chunk, flags_chunk = extract_chunk_data(
+        vis_obs_batch, vis_model_batch, flags_batch,
+        time_chunk_indices, freq_chunk_indices
+    )
+
+    # Get baseline arrays (use REMAPPED indices)
+    ant1_chunk = antenna1_batch_remapped[time_chunk_indices]
+    ant2_chunk = antenna2_batch_remapped[time_chunk_indices]
+
+    # Determine frequency array
+    if freq_chunk_indices is not None:
+        freq_chunk = freq[freq_chunk_indices]
+    else:
+        freq_chunk = freq
+
+    # For K: keep full freq axis; others: average
+    if jt.upper() == 'K':
+        freq_solve = freq_chunk
+    else:
+        freq_solve = None
+
+    # Prepare pre_jones for this chunk
+    pre_jones_chunk = None
+    if pre_jones_list:
+        pre_jones_chunk = []
+        for pj in pre_jones_list:
+            if pj.ndim == 4:
+                if freq_chunk_indices is not None:
+                    pj_chunk = pj[:, freq_chunk_indices, :, :]
+                else:
+                    pj_chunk = pj
+            else:
+                pj_chunk = pj
+            pre_jones_chunk.append(pj_chunk)
+
+    # Solve for this chunk
+    try:
+        jones_chunk, params_chunk, info_chunk = solve(
+            jt,
+            vis_obs_chunk,
+            vis_model_chunk,
+            ant1_chunk,
+            ant2_chunk,
+            n_ant_working,
+            freq=freq_solve,
+            flags=flags_chunk,
+            pre_jones=pre_jones_chunk if pre_jones_chunk else None,
+            ref_ant=ref_ant,
+            phase_only=phase_only,
+            rfi_sigma=rfi_sigma,
+            max_iter=max_iter,
+            tol=tol,
+            verbose=False,
+        )
+        weight = 1.0  # Success
+    except Exception as e:
+        # Solve failed - return zeros with weight=0
+        jones_chunk = np.zeros((n_ant_working, 2, 2), dtype=np.complex128)
+        params_chunk = None
+        info_chunk = {'cost_init': 0.0, 'cost_final': 0.0, 'nfev': 0, 'error': str(e)}
+        weight = 0.0
+
+    return (t_idx, f_idx, jones_chunk, params_chunk, info_chunk, weight)
+
+
+# =============================================================================
 # Main Pipeline
 # =============================================================================
 
@@ -838,6 +1095,7 @@ def run_pipeline(config_path: str, verbose: bool = True):
         rfi_sigma = solve_entry.get('rfi_sigma', 5.0)
         max_iter = solve_entry.get('max_iter', 100)
         tol = solve_entry.get('tol', 1e-10)
+        n_workers = solve_entry.get('n_workers', None)  # None = auto-detect
         output_table = solve_entry.get('output', 'cal.h5')
         
         pre_apply = solve_entry.get('pre_apply', [])
@@ -867,30 +1125,8 @@ def run_pipeline(config_path: str, verbose: bool = True):
                 print(f"Solving: {', '.join(jones_types)}")
                 print(f"Output: {output_table}")
 
-        # Check if chunking is needed
-        from ..core import estimate_ms_selection_size, should_use_chunking, get_available_ram, cleanup_arrays
-
-        # Estimate memory for the FIRST jones term's selection (they all use same field/spw/scans)
-        ms_size_gb, n_rows, n_chan, n_corr = estimate_ms_selection_size(
-            ms_path, field=fields[0], spw=spw, scans=scans
-        )
-        available_ram_gb = get_available_ram()
-        use_chunking, reason = should_use_chunking(ms_size_gb, available_ram_gb, threshold_fraction=0.1)
-
-        if verbose:
-            if RICH_AVAILABLE and console:
-                if use_chunking:
-                    console.print(f"\n[yellow]Memory check:[/yellow] {reason}")
-                    console.print(f"   [dim]→ Using chunked loading to avoid OOM[/dim]")
-                else:
-                    console.print(f"\n[green]Memory check:[/green] {reason}")
-                    console.print(f"   [dim]→ Loading all data at once[/dim]")
-            else:
-                print(f"\nMemory check: {reason}")
-                if use_chunking:
-                    print(f"  → Using chunked loading to avoid OOM")
-                else:
-                    print(f"  → Loading all data at once")
+        # Import cleanup utilities (for future batched loading)
+        from ..core import cleanup_arrays
 
         # Iterate over SPWs
         for spw_idx, spw_id in enumerate(spw_ids):
@@ -926,25 +1162,143 @@ def run_pipeline(config_path: str, verbose: bool = True):
                         else:
                             print(f"\n--- {jt} on field={field} ---")
 
-                # Read MS data for this specific SPW
-                ms_data = read_ms(ms_path, field=field, spw=spw_str, scans=scans)
+                # STEP 1: Load small sample to determine ACTUAL data characteristics
+                # Don't use header info - use actual data to determine working antennas and integration time
+                from casacore.tables import table
+                ms_temp = table(ms_path, readonly=True, ack=False)
 
-                vis_obs = ms_data['vis_obs']
-                vis_model = ms_data['vis_model']
-                antenna1 = ms_data['antenna1']
-                antenna2 = ms_data['antenna2']
-                freq = ms_data['freq']
-                flags = ms_data['flags']
-                n_ant = ms_data['n_ant']
-                time_arr = ms_data['time']
+                # Build selection for sample
+                conditions_sample = []
+                if field is not None:
+                    field_tab = table(f"{ms_path}::FIELD", readonly=True, ack=False)
+                    field_names = list(field_tab.getcol("NAME"))
+                    field_tab.close()
+                    if field in field_names:
+                        field_id = field_names.index(field)
+                        conditions_sample.append(f"FIELD_ID=={field_id}")
 
+                # Get SPW ID for this specific SPW string
+                if spw_str is not None:
+                    spw_part = spw_str.split(":")[0] if ":" in spw_str else spw_str
+                    spw_id_int = int(spw_part)
+                    conditions_sample.append(f"DATA_DESC_ID=={spw_id_int}")
+
+                # Select first 1000 rows to analyze
+                if conditions_sample:
+                    from casacore.tables import taql
+                    query = f"SELECT * FROM $ms_temp WHERE {' AND '.join(conditions_sample)} LIMIT 1000"
+                    sel_sample = taql(query)
+                else:
+                    sel_sample = ms_temp.query("", limit=1000)
+
+                if sel_sample.nrows() == 0:
+                    sel_sample.close()
+                    ms_temp.close()
+                    raise ValueError(f"No data found for field={field}, SPW={spw_str}")
+
+                # Get ACTUAL working antennas from data
+                ant1_sample = sel_sample.getcol("ANTENNA1")
+                ant2_sample = sel_sample.getcol("ANTENNA2")
+                working_ants = np.unique(np.concatenate([ant1_sample, ant2_sample]))
+                n_ant_working = len(working_ants)
+
+                # Create mapping: MS antenna index -> contiguous 0-based index
+                # e.g., if working_ants = [0, 5, 10, 15], map: 0->0, 5->1, 10->2, 15->3
+                ant_map = {int(ms_idx): i for i, ms_idx in enumerate(working_ants)}
+
+                # Get antenna names
+                ant_tab = table(f"{ms_path}::ANTENNA", readonly=True, ack=False)
+                ant_names_all = ant_tab.getcol("NAME")
+                ant_tab.close()
+                # Convert to numpy array for proper indexing
+                ant_names_all = np.array(ant_names_all)
+                working_ants = np.array(working_ants, dtype=np.int32)
+                ant_names = [ant_names_all[i] for i in working_ants]
+
+                # Get ACTUAL integration time from data
+                time_sample = sel_sample.getcol("TIME")
+                unique_times_sample = np.unique(time_sample)
+                if len(unique_times_sample) > 1:
+                    time_diffs = np.diff(unique_times_sample)
+                    actual_int_time = np.median(time_diffs[time_diffs > 0])
+                else:
+                    actual_int_time = 1.0
+
+                # Get frequency and other metadata
+                spw_tab = table(f"{ms_path}::SPECTRAL_WINDOW", readonly=True, ack=False)
+                freq = spw_tab.getcol("CHAN_FREQ")[spw_id_int]
+                spw_tab.close()
+                n_chan = len(freq)
+
+                # Get feed basis
+                pol_tab = table(f"{ms_path}::POLARIZATION", readonly=True, ack=False)
+                corr_type = pol_tab.getcol("CORR_TYPE")[0]
+                pol_tab.close()
+                if corr_type[0] in [9, 10, 11, 12]:
+                    feed_basis = FeedBasis.LINEAR
+                elif corr_type[0] in [5, 6, 7, 8]:
+                    feed_basis = FeedBasis.CIRCULAR
+                else:
+                    feed_basis = FeedBasis.LINEAR
+
+                sel_sample.close()
+                ms_temp.close()
+
+                # STEP 2: Parse solint intervals and use ACTUAL integration time for chunking
+                current_time_interval = time_interval[idx]
+                current_freq_interval = freq_interval[idx]
+                time_interval_sec = parse_time_interval(current_time_interval)
+
+                # If user specified interval is smaller than actual integration, use actual
+                if time_interval_sec < actual_int_time:
+                    if verbose:
+                        if RICH_AVAILABLE and console:
+                            console.print(f"   [yellow]Warning:[/yellow] Requested time interval ({time_interval_sec:.1f}s) < actual integration time ({actual_int_time:.1f}s)")
+                            console.print(f"   [yellow]Using actual integration time for chunking[/yellow]")
+                    time_interval_sec = actual_int_time
+
+                # STEP 3: Get full time array and create chunk boundaries
+                time_arr_full = get_ms_time_array(ms_path, field=field, spw=spw_str, scans=scans)
+                unique_times = np.unique(time_arr_full)
+
+                # Group by actual unique timestamps for solution intervals
+                # If solint >= actual int time, group multiple timestamps
+                t_min, t_max = unique_times.min(), unique_times.max()
+                chunk_assignments = ((unique_times - t_min) / time_interval_sec).astype(int)
+                n_time_chunks = chunk_assignments.max() + 1
+
+                # Create chunk boundaries from actual timestamps
+                time_chunk_boundaries = []
+                for chunk_id in range(n_time_chunks):
+                    mask = chunk_assignments == chunk_id
+                    if np.any(mask):
+                        chunk_times = unique_times[mask]
+                        time_chunk_boundaries.append((chunk_times.min(), chunk_times.max()))
+
+                n_time_chunks = len(time_chunk_boundaries)
+                n_baseline = n_ant_working * (n_ant_working - 1) // 2
+
+                # STEP 5: Calculate batch plan based on memory constraints
+                from ..core.resources import compute_batch_plan, get_available_ram
+                total_time_sec = t_max - t_min
+                available_ram_gb = get_available_ram()
+                n_chunks_total, n_chunks_per_batch, plan_str = compute_batch_plan(
+                    total_time_sec, time_interval_sec, n_baseline, n_chan,
+                    available_ram_gb, safety_factor=0.3  # Conservative: use only 30% of available RAM
+                )
+
+                # STEP 6: Report plan (ONCE, professional)
                 if verbose:
                     if RICH_AVAILABLE and console:
-                        console.print(f"   Loading data... [dim]{vis_obs.shape[0]} rows, {vis_obs.shape[1]} chans, {n_ant} ants[/dim]")
-                        console.print(f"   Feed basis: [dim]{ms_data['feed_basis'].value}[/dim]")
+                        console.print(f"   [bold]Data:[/bold] {n_time_chunks} time chunks, {n_chan} chans, {n_ant_working} working ants, {n_baseline} baselines")
+                        console.print(f"   [bold]Int time:[/bold] {actual_int_time:.2f}s")
+                        console.print(f"   [bold]Memory:[/bold] {plan_str}")
+                        console.print(f"   [bold]Feed:[/bold] {feed_basis.value}")
                     else:
-                        print(f"  Loaded: {vis_obs.shape[0]} rows, {vis_obs.shape[1]} chans, {n_ant} ants")
-                        print(f"  Feed basis: {ms_data['feed_basis'].value}")
+                        print(f"  Data: {n_time_chunks} time chunks, {n_chan} chans, {n_ant_working} working ants")
+                        print(f"  Int time: {actual_int_time:.2f}s")
+                        print(f"  Memory: {plan_str}")
+                        print(f"  Feed: {feed_basis.value}")
 
                 # Build pre-apply Jones list
                 pre_jones_list = []
@@ -1029,45 +1383,35 @@ def run_pipeline(config_path: str, verbose: bool = True):
                     else:
                         print(f"  Pre-applying: {len(pre_jones_list)} Jones terms")
 
-                # Parse solint intervals
-                current_time_interval = time_interval[idx]
-                current_freq_interval = freq_interval[idx]
+                # Parse freq interval (time interval already parsed above)
+                from ..core.solint import create_freq_chunks
+                chan_width = np.median(np.diff(freq)) if len(freq) > 1 else freq[0] * 0.01
+                freq_interval_hz = parse_freq_interval(current_freq_interval, chan_width)
 
-                # Parse time interval to seconds
-                time_interval_sec = parse_time_interval(current_time_interval)
-
-                # Parse freq interval to Hz
-                if vis_obs.ndim == 4:
-                    chan_width = np.median(np.diff(freq)) if len(freq) > 1 else freq[0] * 0.01
-                    freq_interval_hz = parse_freq_interval(current_freq_interval, chan_width)
-                else:
-                    freq_interval_hz = None
-
-                # Create time chunks
-                time_chunks = create_time_chunks(time_arr, time_interval_sec)
-                n_time_chunks = len(time_chunks)
-
-                # Create frequency chunks (only if data has freq axis)
-                if vis_obs.ndim == 4 and jt.upper() != 'K':
-                    # For non-K terms with freq axis
+                # Create frequency chunks (determine based on Jones type)
+                # Note: For K term, we keep full freq axis for delay estimation
+                if jt.upper() != 'K':
+                    # For B/G/D/Xf: Create freq chunks
                     freq_chunks = create_freq_chunks(freq, freq_interval_hz)
                     n_freq_chunks = len(freq_chunks)
                 else:
-                    # K term or no freq axis: single freq chunk (all channels)
-                    freq_chunks = [np.arange(len(freq))] if vis_obs.ndim == 4 else [None]
+                    # K term: single freq chunk (all channels, needed for delay)
+                    freq_chunks = [np.arange(len(freq))]
                     n_freq_chunks = 1
+
+                total_blocks = n_time_chunks * n_freq_chunks
 
                 if verbose:
                     if RICH_AVAILABLE and console:
-                        console.print(f"   Solint: [cyan]{current_time_interval}[/cyan] (time), [cyan]{current_freq_interval}[/cyan] (freq)")
-                        console.print(f"   Creating: [cyan]{n_time_chunks}[/cyan] time × [cyan]{n_freq_chunks}[/cyan] freq = [bold cyan]{n_time_chunks * n_freq_chunks}[/bold cyan] solution blocks")
+                        console.print(f"   [bold]Solint:[/bold] [cyan]{current_time_interval}[/cyan] (time), [cyan]{current_freq_interval}[/cyan] (freq)")
+                        console.print(f"   [bold]Solving:[/bold] [cyan]{n_time_chunks}[/cyan] time × [cyan]{n_freq_chunks}[/cyan] freq = [bold cyan]{total_blocks}[/bold cyan] solution blocks")
                     else:
                         print(f"  Solint: {current_time_interval} (time), {current_freq_interval} (freq)")
-                        print(f"  Creating: {n_time_chunks} time × {n_freq_chunks} freq = {n_time_chunks * n_freq_chunks} solution blocks")
+                        print(f"  Solving: {n_time_chunks} time × {n_freq_chunks} freq = {total_blocks} solution blocks")
 
-                # Solve per chunk
+                # STEP 7: Batched loading and solving
                 jones_solutions = []
-                total_blocks = n_time_chunks * n_freq_chunks
+                weights_solutions = []
                 block_idx = 0
 
                 # Track convergence info for all blocks
@@ -1075,6 +1419,13 @@ def run_pipeline(config_path: str, verbose: bool = True):
                 all_costs_init = []
                 all_costs_final = []
                 all_nfev = []
+
+                # Track number of workers used (for timing output)
+                n_workers_auto = 1  # Default to serial
+
+                # Start timer for this Jones solve
+                import time
+                solve_start_time = time.time()
 
                 # Progress tracking
                 if verbose and total_blocks > 1:
@@ -1089,80 +1440,100 @@ def run_pipeline(config_path: str, verbose: bool = True):
                         task = progress.add_task("  Progress:", total=total_blocks)
                         progress.start()
 
-                for t_idx, time_chunk_indices in enumerate(time_chunks):
-                    jones_freq_solutions = []
+                # Loop over batches of time chunks
+                n_batches = int(np.ceil(n_time_chunks / n_chunks_per_batch))
 
-                    for f_idx, freq_chunk_indices in enumerate(freq_chunks):
-                        # Extract chunk data
-                        vis_obs_chunk, vis_model_chunk, flags_chunk = extract_chunk_data(
-                            vis_obs, vis_model, flags, time_chunk_indices, freq_chunk_indices
-                        )
+                for batch_idx in range(n_batches):
+                    batch_start_idx = batch_idx * n_chunks_per_batch
+                    batch_end_idx = min(batch_start_idx + n_chunks_per_batch, n_time_chunks)
 
-                        # Get baseline arrays for this chunk
-                        ant1_chunk = antenna1[time_chunk_indices]
-                        ant2_chunk = antenna2[time_chunk_indices]
+                    # Determine time range for this batch (union of all chunks in batch)
+                    t_min_batch = time_chunk_boundaries[batch_start_idx][0]
+                    t_max_batch = time_chunk_boundaries[batch_end_idx - 1][1]
 
-                        # Determine frequency array for this chunk
-                        if vis_obs.ndim == 4:
-                            if freq_chunk_indices is not None:
-                                freq_chunk = freq[freq_chunk_indices]
-                            else:
-                                freq_chunk = freq
+                    # Load MS data for this batch ONLY
+                    ms_data = read_ms(
+                        ms_path, field=field, spw=spw_str, scans=scans,
+                        time_min=t_min_batch, time_max=t_max_batch
+                    )
 
-                            # For K: ALWAYS keep full freq axis (needed for delay estimation)
-                            if jt.upper() == 'K':
-                                freq_solve = freq_chunk
-                            else:
-                                # For B/G/D: Average within chunk (pass None to tell solver to average)
-                                # Each chunk produces one freq-averaged solution
-                                freq_solve = None
-                        else:
-                            freq_solve = None
+                    vis_obs_batch = ms_data['vis_obs']
+                    vis_model_batch = ms_data['vis_model']
+                    antenna1_batch = ms_data['antenna1']
+                    antenna2_batch = ms_data['antenna2']
+                    flags_batch = ms_data['flags']
+                    time_arr_batch = ms_data['time']
 
-                        # Prepare pre_jones for this chunk
-                        pre_jones_chunk = None
-                        if pre_jones_list:
-                            pre_jones_chunk = []
-                            for pj in pre_jones_list:
-                                if pj.ndim == 4:
-                                    # Freq-dependent: extract freq chunk
-                                    if freq_chunk_indices is not None:
-                                        pj_chunk = pj[:, freq_chunk_indices, :, :]
-                                    else:
-                                        pj_chunk = pj
-                                else:
-                                    # Already freq-averaged
-                                    pj_chunk = pj
-                                pre_jones_chunk.append(pj_chunk)
+                    # Remap antenna indices from MS indices to contiguous 0-based indices
+                    # This is CRITICAL: solver expects antenna indices 0, 1, 2, ..., n_ant_working-1
+                    # but MS might have gaps like 0, 5, 10, 15, ...
+                    antenna1_batch_remapped = np.array([ant_map[int(a)] for a in antenna1_batch], dtype=np.int32)
+                    antenna2_batch_remapped = np.array([ant_map[int(a)] for a in antenna2_batch], dtype=np.int32)
 
-                        # Solve for this chunk
-                        # Solver handles averaging per baseline internally
-                        jones_chunk, params_chunk, info_chunk = solve(
-                            jt,
-                            vis_obs_chunk,
-                            vis_model_chunk,
-                            ant1_chunk,
-                            ant2_chunk,
-                            n_ant,
-                            freq=freq_solve,
-                            flags=flags_chunk,
-                            pre_jones=pre_jones_chunk if pre_jones_chunk else None,
-                            ref_ant=ref_ant,
-                            phase_only=phase_only[idx],
-                            rfi_sigma=rfi_sigma,
-                            max_iter=max_iter,
-                            tol=tol,
-                            verbose=False,  # Suppress per-chunk verbose output
-                        )
+                    # Set global batch data for workers (shared via fork, no copy!)
+                    global _batch_data
+                    _batch_data = {
+                        'vis_obs': vis_obs_batch,
+                        'vis_model': vis_model_batch,
+                        'flags': flags_batch,
+                        'antenna1_remapped': antenna1_batch_remapped,
+                        'antenna2_remapped': antenna2_batch_remapped,
+                        'time': time_arr_batch,
+                        'freq': freq,
+                        'pre_jones_list': pre_jones_list,
+                    }
 
-                        jones_freq_solutions.append(jones_chunk)
+                    # Prepare lightweight chunk tasks (no large arrays!)
+                    chunk_tasks = []
+                    for t_idx in range(batch_start_idx, batch_end_idx):
+                        t_start_chunk, t_end_chunk = time_chunk_boundaries[t_idx]
+                        for f_idx, freq_chunk_indices in enumerate(freq_chunks):
+                            chunk_tasks.append((
+                                t_idx, f_idx, t_start_chunk, t_end_chunk, freq_chunk_indices,
+                                jt, n_ant_working, ref_ant, phase_only[idx],
+                                rfi_sigma, max_iter, tol
+                            ))
+
+                    # Solve chunks in parallel using multiprocessing
+                    import multiprocessing as mp
+                    import os
+                    import time
+
+                    # Determine number of workers
+                    if n_workers is None:
+                        # Auto-detect: default to 8, but don't exceed available cores or tasks
+                        n_workers_auto = min(os.cpu_count() or 1, len(chunk_tasks), 8)
+                    else:
+                        # User specified: respect their choice (no artificial cap)
+                        n_workers_auto = min(n_workers, len(chunk_tasks))
+
+                    # Start timer for this batch
+                    batch_start_time = time.time()
+
+                    if n_workers_auto > 1 and len(chunk_tasks) > 1:
+                        # Parallel solving
+                        with mp.Pool(processes=n_workers_auto) as pool:
+                            chunk_results = pool.map(_solve_chunk_worker, chunk_tasks)
+                    else:
+                        # Serial fallback (single chunk or single core)
+                        chunk_results = [_solve_chunk_worker(task) for task in chunk_tasks]
+
+                    # Process parallel results
+                    # Organize results by (t_idx, f_idx)
+                    result_dict = {}
+                    weight_dict = {}
+                    for t_idx_r, f_idx_r, jones_chunk, params_chunk, info_chunk, weight in chunk_results:
+                        if t_idx_r not in result_dict:
+                            result_dict[t_idx_r] = {}
+                            weight_dict[t_idx_r] = {}
+                        result_dict[t_idx_r][f_idx_r] = (jones_chunk, params_chunk, info_chunk)
+                        weight_dict[t_idx_r][f_idx_r] = weight
 
                         # Store convergence info
                         all_block_info.append({
-                            't_idx': t_idx,
-                            'f_idx': f_idx,
+                            't_idx': t_idx_r,
+                            'f_idx': f_idx_r,
                             'info': info_chunk,
-                            'jones': jones_chunk
                         })
                         all_costs_init.append(info_chunk.get('cost_init', 0.0))
                         all_costs_final.append(info_chunk.get('cost_final', 0.0))
@@ -1173,33 +1544,71 @@ def run_pipeline(config_path: str, verbose: bool = True):
                         if verbose and total_blocks > 1 and RICH_AVAILABLE and console:
                             progress.update(task, completed=block_idx)
 
-                    jones_solutions.append(jones_freq_solutions)
+                    # Build jones_solutions and weights_solutions structure in correct order
+                    for t_idx in range(batch_start_idx, batch_end_idx):
+                        jones_freq_solutions = []
+                        weights_freq_solutions = []
+                        for f_idx in range(n_freq_chunks):
+                            if t_idx in result_dict and f_idx in result_dict[t_idx]:
+                                jones_chunk, params_chunk, info_chunk = result_dict[t_idx][f_idx]
+                                jones_freq_solutions.append(jones_chunk)
+                                weights_freq_solutions.append(weight_dict[t_idx][f_idx])
+                            else:
+                                # Empty chunk (no data)
+                                jones_empty = np.zeros((n_ant_working, 2, 2), dtype=np.complex128)
+                                jones_freq_solutions.append(jones_empty)
+                                weights_freq_solutions.append(0.0)
+                        jones_solutions.append(jones_freq_solutions)
+                        weights_solutions.append(weights_freq_solutions)
+
+                    # Free batch memory before loading next batch
+                    cleanup_arrays(vis_obs_batch, vis_model_batch, flags_batch,
+                                   antenna1_batch, antenna2_batch, time_arr_batch,
+                                   antenna1_batch_remapped, antenna2_batch_remapped)
+                    del ms_data
+
+                    # Clear global batch data
+                    _batch_data.clear()
+
+                    # Force garbage collection to free memory immediately
+                    import gc
+                    gc.collect()
 
                 # Stop progress bar
                 if verbose and total_blocks > 1 and RICH_AVAILABLE and console:
                     progress.stop()
 
                 # Reshape solutions to (n_time, n_freq, n_ant, 2, 2) or appropriate shape
+                # Also reshape weights to (n_time, n_freq)
                 if n_time_chunks == 1 and n_freq_chunks == 1:
                     # Single solution
                     jones = jones_solutions[0][0]
+                    weights = np.array([[weights_solutions[0][0]]], dtype=np.float64)
                     params = params_chunk
                     info = info_chunk
                 elif n_time_chunks > 1 and n_freq_chunks == 1:
                     # Multiple time solutions, single freq
                     jones = np.array([sol[0] for sol in jones_solutions])
+                    weights = np.array([[w[0]] for w in weights_solutions], dtype=np.float64)
                     params = params_chunk
                     info = info_chunk
                 elif n_time_chunks == 1 and n_freq_chunks > 1:
                     # Single time, multiple freq solutions
                     jones = np.array(jones_solutions[0])
+                    weights = np.array([weights_solutions[0]], dtype=np.float64)
                     params = params_chunk
                     info = info_chunk
                 else:
                     # Multiple time and freq solutions
                     jones = np.array([[sol for sol in time_sol] for time_sol in jones_solutions])
+                    weights = np.array(weights_solutions, dtype=np.float64)
                     params = params_chunk
                     info = info_chunk
+
+                # Free jones_solutions and weights_solutions immediately after reshaping to save memory
+                del jones_solutions, weights_solutions
+                import gc
+                gc.collect()
 
                 # Comprehensive statistics output
                 if verbose:
@@ -1291,26 +1700,31 @@ def run_pipeline(config_path: str, verbose: bool = True):
                             console.print(f"         Final cost: {worst_block['info'].get('cost_final', 0):.6e}")
                             console.print(f"         Cost reduction: {worst_block['info'].get('cost_init', 1) / max(worst_block['info'].get('cost_final', 1), 1e-20):.2f}×")
 
+                        # Timing
+                        solve_time = time.time() - solve_start_time
+                        console.print(f"\n   [bold]Timing:[/bold]")
+                        if solve_time < 60:
+                            console.print(f"      Total time: {solve_time:.1f}s")
+                        else:
+                            console.print(f"      Total time: {solve_time/60:.1f} min ({solve_time:.1f}s)")
+                        if n_workers_auto > 1:
+                            console.print(f"      Workers: {n_workers_auto} (parallel)")
+                        else:
+                            console.print(f"      Workers: 1 (serial)")
+
                     else:
                         print(f"  Jones solution shape: {jones.shape}")
 
                 # Save with SPW suffix if multiple SPWs
                 jt_save = f"{jt}_spw{spw_id}" if n_spws > 1 else jt
 
-                # Create time grid for saved solutions
-                t_min = np.min(time_arr)
-                t_max = np.max(time_arr)
-                if n_time_chunks == 1:
-                    time_grid = np.array([np.mean(time_arr)])
-                else:
-                    # Midpoints of time chunks
-                    time_chunk_edges = np.linspace(t_min, t_max, n_time_chunks + 1)
-                    time_grid = (time_chunk_edges[:-1] + time_chunk_edges[1:]) / 2.0
+                # Create time grid for saved solutions (use chunk midpoints)
+                time_grid = np.array([(t_start + t_end) / 2.0 for t_start, t_end in time_chunk_boundaries])
 
                 # Create frequency grid for saved solutions
                 if n_freq_chunks == 1:
                     # Single freq chunk: use full freq array or None
-                    if jt.upper() == 'K' and vis_obs.ndim == 4:
+                    if jt.upper() == 'K':
                         freq_grid = freq
                     else:
                         freq_grid = None
@@ -1319,10 +1733,67 @@ def run_pipeline(config_path: str, verbose: bool = True):
                     freq_grid = np.array([np.mean(freq[chunk]) for chunk in freq_chunks])
 
                 quality_obj = info.get('quality', None)
+
+                # Apply fluxscale if requested for G mode
+                flux_results = None
+                if jt.upper() == 'G' and 'fluxscale' in cfg:
+                    fluxscale_cfg = cfg['fluxscale']
+                    if fluxscale_cfg.get('enable', False):
+                        if verbose:
+                            if RICH_AVAILABLE and console:
+                                console.print(f"\n   [bold]Applying flux scaling[/bold]")
+                            else:
+                                print(f"\n  Applying flux scaling")
+
+                        # Get reference gains
+                        ref_fields = fluxscale_cfg.get('reference_field', [])
+                        if isinstance(ref_fields, str):
+                            ref_fields = [ref_fields]
+
+                        # Check if external reference table provided
+                        ref_table = fluxscale_cfg.get('reference_table', None)
+
+                        if ref_table:
+                            # Load from external file
+                            ref_data = load_jones(ref_table, 'G')
+                            jones_ref = ref_data['jones']
+                            freq_ref = ref_data.get('freq', None)
+
+                            if verbose:
+                                if RICH_AVAILABLE and console:
+                                    console.print(f"      Reference: [cyan]{ref_table}[/cyan]")
+                                else:
+                                    print(f"    Reference: {ref_table}")
+                        else:
+                            # On-the-fly: assume all fields solved in current MS
+                            # This would require multi-field solving support
+                            # For now, raise error
+                            raise ValueError("On-the-fly fluxscale (multi-field in same solve) not yet implemented. "
+                                           "Please provide reference_table.")
+
+                        # Apply fluxscale
+                        jones_scaled, flux_results = compute_fluxscale(
+                            jones_ref,
+                            jones,
+                            freq=freq_grid,
+                            verbose=verbose
+                        )
+
+                        # Replace jones with scaled version
+                        jones = jones_scaled
+
+                        if verbose:
+                            if RICH_AVAILABLE and console:
+                                console.print(f"      [green]Flux scaling applied successfully[/green]")
+                            else:
+                                print(f"    Flux scaling applied successfully")
+
                 save_jones(
                     output_table, jt_save, jones,
                     time=time_grid,
                     freq=freq_grid,
+                    antenna=working_ants,
+                    weights=weights,
                     params=params,
                     metadata={
                         'ref_antenna': ref_ant,
@@ -1332,10 +1803,15 @@ def run_pipeline(config_path: str, verbose: bool = True):
                         'phase_only': phase_only[idx],
                         'time_interval': current_time_interval,
                         'freq_interval': current_freq_interval,
+                        'actual_int_time': actual_int_time,
                         'n_time_chunks': n_time_chunks,
                         'n_freq_chunks': n_freq_chunks,
+                        'antenna_names': ant_names,
+                        'n_ant_total': len(ant_names_all),
+                        'n_ant_working': n_ant_working,
                         'cost_init': info.get('cost_init'),
                         'cost_final': info.get('cost_final'),
+                        'fluxscale': flux_results if flux_results else None,
                     },
                     quality=quality_obj,
                     overwrite=True,
@@ -1376,14 +1852,6 @@ def run_pipeline(config_path: str, verbose: bool = True):
                     jones_for_chain = np.transpose(jones[0], (1, 0, 2, 3))
                     solved_jones[jt] = {'jones': jones_for_chain, 'freq': freq_grid}
 
-            # Cleanup memory after solving
-            cleanup_arrays(vis_obs, vis_model)
-            if verbose:
-                if RICH_AVAILABLE and console:
-                    console.print(f"   [dim]Memory cleaned up[/dim]")
-                else:
-                    print(f"  Memory cleaned up")
-    
     # Process apply entries
     for apply_entry in cfg.get('apply', []):
         # Get parameters

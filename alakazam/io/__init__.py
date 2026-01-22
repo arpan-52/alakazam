@@ -21,6 +21,7 @@ def save_jones(
     freq: np.ndarray,
     antenna: np.ndarray = None,
     flags: np.ndarray = None,
+    weights: np.ndarray = None,
     params: Dict[str, np.ndarray] = None,
     metadata: Dict[str, Any] = None,
     overwrite: bool = False,
@@ -36,6 +37,7 @@ def save_jones(
             freq        (n_freq,) float64
             antenna     (n_ant,) int32
             flags       (n_time, n_freq, n_ant) bool
+            weights     (n_time, n_freq) float64  [NEW]
             /params/
                 delay   (n_ant, 2) float64  [for K]
                 d_xy    (n_ant,) complex128 [for D]
@@ -44,6 +46,8 @@ def save_jones(
                 ref_antenna, field, mode, ...
             /quality/      [NEW]
                 snr, rmse, reduced_chi2, r_squared, etc.
+
+    weights: 1.0 = valid solution, 0.0 = failed/empty chunk (don't use)
     """
     jones = np.asarray(jones, dtype=np.complex128)
     time = np.atleast_1d(np.asarray(time, dtype=np.float64))
@@ -58,13 +62,16 @@ def save_jones(
         jones = jones[np.newaxis, :, :, :, :]
     
     n_time, n_freq, n_ant = jones.shape[:3]
-    
+
     if antenna is None:
         antenna = np.arange(n_ant, dtype=np.int32)
-    
+
     if flags is None:
         flags = np.zeros((n_time, n_freq, n_ant), dtype=np.bool_)
-    
+
+    if weights is None:
+        weights = np.ones((n_time, n_freq), dtype=np.float64)
+
     # Open file
     mode = 'a' if Path(filename).exists() else 'w'
     with h5py.File(filename, mode) as f:
@@ -73,15 +80,16 @@ def save_jones(
                 del f[jones_type]
             else:
                 raise ValueError(f"{jones_type} exists. Use overwrite=True")
-        
+
         grp = f.create_group(jones_type)
-        
+
         # Main data
         grp.create_dataset('jones', data=jones, compression='gzip')
         grp.create_dataset('time', data=time)
         grp.create_dataset('freq', data=freq)
         grp.create_dataset('antenna', data=antenna)
         grp.create_dataset('flags', data=flags, compression='gzip')
+        grp.create_dataset('weights', data=weights, compression='gzip')
         
         # Native params
         if params:
@@ -130,16 +138,16 @@ def save_jones(
 def load_jones(filename: str, jones_type: str) -> Dict[str, Any]:
     """
     Load Jones solution from HDF5.
-    
+
     Returns dict with:
-        jones, time, freq, antenna, flags, params, metadata
+        jones, time, freq, antenna, flags, weights, params, metadata
     """
     with h5py.File(filename, 'r') as f:
         if jones_type not in f:
             raise KeyError(f"{jones_type} not in {filename}")
-        
+
         grp = f[jones_type]
-        
+
         data = {
             'jones': grp['jones'][:],
             'time': grp['time'][:],
@@ -147,21 +155,28 @@ def load_jones(filename: str, jones_type: str) -> Dict[str, Any]:
             'antenna': grp['antenna'][:],
             'flags': grp['flags'][:],
         }
-        
+
+        # Weights (backward compatible - default to all 1s if not present)
+        if 'weights' in grp:
+            data['weights'] = grp['weights'][:]
+        else:
+            n_time, n_freq = grp['jones'].shape[:2]
+            data['weights'] = np.ones((n_time, n_freq), dtype=np.float64)
+
         # Params
         params = {}
         if 'params' in grp:
             for k in grp['params']:
                 params[k] = grp['params'][k][:]
         data['params'] = params
-        
+
         # Metadata
         metadata = {}
         if 'metadata' in grp:
             for k in grp['metadata'].attrs:
                 metadata[k] = grp['metadata'].attrs[k]
         data['metadata'] = metadata
-    
+
     return data
 
 

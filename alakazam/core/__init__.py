@@ -508,6 +508,7 @@ def solve(
 from .metadata import detect_ms_metadata, detect_non_working_antennas_chunked, MSMetadata
 from .chunking import iterate_chunks, DataChunk
 from .interpolation import interpolate_jones_to_chunk, interpolate_jones_time, interpolate_jones_freq
+from .fluxscale import compute_fluxscale, compute_fluxscale_multi_field, log_flux_results
 from .rfi import flag_rfi_mad as flag_rfi_mad_v2, apply_flags
 from .averaging import average_time_freq, average_per_baseline as average_per_baseline_v2, average_visibilities as average_visibilities_v2, average_model_visibilities
 from .solver import CalibrationSolver, SolverConfig, SolverResult
@@ -535,6 +536,9 @@ __all__ = [
     'iterate_chunks',
     'DataChunk',
     'interpolate_jones_to_chunk',
+    'compute_fluxscale',
+    'compute_fluxscale_multi_field',
+    'log_flux_results',
     'flag_rfi_mad_v2',
     'average_time_freq',
     'average_per_baseline_v2',
