@@ -41,6 +41,17 @@ min_J  Σ_ij |w_ij (V_ij^obs - J_i V_ij^model J_j^H)|²
 
 where `w_ij` are visibility weights and the sum is over all baselines.
 
+## Supported Jones Terms
+
+| Symbol | Name | Parameters | Averaging | Reference Constraint |
+|--------|------|------------|-----------|---------------------|
+| **K** | Delay | Delay τ per antenna, per pol | Time-averaged | τ_ref = 0 |
+| **B** | Bandpass | Complex gain per antenna, per freq, per pol | Time-averaged | ∠g_ref = 0 |
+| **G** | Gain | Complex gain per antenna, per pol | Freq-averaged | ∠g_ref = 0 |
+| **D** | Leakage | Off-diagonal terms d_xy, d_yx | Time & freq averaged | d_ref = 0 |
+| **Xf** | Crosshand phase | Phase ϕ between X-Y correlations | Time & freq averaged | None |
+| **Kcross** | Crosshand delay | Delay τ_xy between X-Y | Time-averaged | τ_xy,ref = 0 |
+
 ### Delay (K)
 
 Parameterization:
@@ -411,6 +422,78 @@ phase_only: true
 ```
 
 This constrains `|g_X| = |g_Y| = 1`, solving only for phases.
+
+### Flux Scaling
+
+**Flux scaling** transfers the absolute flux density scale from a flux calibrator to phase calibrators. This is required when phase calibrators are solved with unknown flux densities (assumed 1 Jy).
+
+**Method:**
+
+The gain amplitudes from a flux calibrator (known flux) are compared to those from a phase calibrator (unknown flux):
+
+```
+scale[spw, pol] = <|G_flux|> / <|G_phase|>
+flux_phase[spw, pol] = scale² Jy    (if assumed 1 Jy)
+G_phase_scaled = scale × G_phase
+```
+
+Where averaging is over time and antennas, and X and Y polarizations are scaled independently.
+
+**Configuration:**
+
+```yaml
+jones: [G]
+
+solint:
+  time_interval: 2min
+  freq_interval: full
+
+fluxscale:
+  enable: true
+  reference_field: ["3C286", "3C48"]         # Can be single or multiple
+  reference_table: "flux_cal_G.h5"           # G solutions for reference field(s)
+  transfer_field: ["J1234+5678", "J0927"]    # Can be single or multiple
+```
+
+**Example workflow:**
+
+```yaml
+# Step 1: Solve G for flux calibrator (3C286 with known model)
+ms_files: "flux_cal.ms"
+output_h5: "flux_cal_G.h5"
+field: "3C286"
+jones: [G]
+solint:
+  time_interval: 2min
+  freq_interval: full
+ref_ant: 0
+```
+
+```yaml
+# Step 2: Solve G for phase calibrator and apply fluxscale
+ms_files: "phase_cal.ms"
+output_h5: "phase_cal_G_scaled.h5"
+field: "J1234+5678"
+jones: [G]
+solint:
+  time_interval: 2min
+  freq_interval: full
+ref_ant: 0
+
+fluxscale:
+  enable: true
+  reference_field: "3C286"
+  reference_table: "flux_cal_G.h5"
+  transfer_field: "J1234+5678"
+```
+
+The output `phase_cal_G_scaled.h5` contains flux-scaled gains ready for application to science targets.
+
+**Notes:**
+- Only available for G (gain) mode
+- X and Y polarizations scaled independently
+- Scale factors computed per SPW (averaged over antennas)
+- Preserves native Jones table dimensions
 
 ### Parallel Processing
 

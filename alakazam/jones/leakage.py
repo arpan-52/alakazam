@@ -18,6 +18,7 @@ from typing import Dict, Optional
 import logging
 
 from .base import JonesEffect, JonesMetadata, JonesTypeEnum, SolveResult
+from ..core.initialization import compute_initial_jones_chain
 
 logger = logging.getLogger('jackal')
 
@@ -89,6 +90,39 @@ def _leakage_params_to_jones(params: np.ndarray, n_ant: int, ref_ant: int,
                 idx += 2
 
     return jones
+
+
+@njit(cache=True)
+def _leakage_jones_to_params(jones: np.ndarray, ref_ant: int, d_constraint: str,
+                             working_ants: np.ndarray) -> np.ndarray:
+    """Convert leakage Jones to parameters."""
+    n_params = 0
+    for a in working_ants:
+        if a != ref_ant:
+            n_params += 4 if d_constraint == 'both' else 2
+
+    params = np.zeros(n_params, dtype=np.float64)
+    idx = 0
+
+    for i in range(len(working_ants)):
+        a = working_ants[i]
+        if a != ref_ant:
+            if d_constraint == 'both':
+                params[idx] = jones[a, 0, 1].real
+                params[idx + 1] = jones[a, 0, 1].imag
+                params[idx + 2] = jones[a, 1, 0].real
+                params[idx + 3] = jones[a, 1, 0].imag
+                idx += 4
+            elif d_constraint == 'XY':
+                params[idx] = jones[a, 1, 0].real
+                params[idx + 1] = jones[a, 1, 0].imag
+                idx += 2
+            elif d_constraint == 'YX':
+                params[idx] = jones[a, 0, 1].real
+                params[idx + 1] = jones[a, 0, 1].imag
+                idx += 2
+
+    return params
 
 
 @njit(parallel=True, cache=True)
@@ -229,14 +263,22 @@ class DLeakage(JonesEffect):
                 flagging_stats={}
             )
 
-        # Initial guess: d=0 for all
-        n_params = 0
-        for a in working_ants:
-            if a != ref_ant:
-                n_params += 4 if d_constraint == 'both' else 2
-        p0 = np.zeros(n_params, dtype=np.float64)
+        # Compute initial guess using direct chain method
+        logger.info("  Computing initial guess from direct chain method...")
+        jones_init = compute_initial_jones_chain(
+            vis_obs_filt, vis_model_filt, ant1_filt, ant2_filt,
+            n_ant, ref_ant=ref_ant, flags=None, verbose=False
+        )
 
-        logger.info(f"  Initial guess: d=0 for all antennas ({n_params} parameters)")
+        # Set diagonal to 1 (leakage assumes diagonal is unity)
+        jones_init[:, 0, 0] = 1.0
+        jones_init[:, 1, 1] = 1.0
+
+        # Extract params for optimizer
+        p0 = _leakage_jones_to_params(jones_init, ref_ant, d_constraint, working_ants)
+
+        n_params = len(p0)
+        logger.info(f"  Initial guess from chain: {n_params} parameters")
 
         # Optimize
         def residual(p):

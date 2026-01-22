@@ -16,6 +16,7 @@ from typing import Dict, Optional
 import logging
 
 from .base import JonesEffect, JonesMetadata, JonesTypeEnum, SolveResult
+from ..core.initialization import compute_initial_jones_chain
 
 logger = logging.getLogger('jackal')
 
@@ -110,6 +111,16 @@ def _xf_params_to_jones(params: np.ndarray, n_ant: int) -> np.ndarray:
     return jones
 
 
+@njit(cache=True)
+def _xf_jones_to_params(jones: np.ndarray) -> np.ndarray:
+    """Convert Xf Jones to parameters."""
+    n_ant = jones.shape[0]
+    params = np.zeros(n_ant, dtype=np.float64)
+    for a in range(n_ant):
+        params[a] = np.angle(jones[a, 1, 1])
+    return params
+
+
 @njit(parallel=True, cache=True)
 def _xf_residual(params: np.ndarray, vis_obs: np.ndarray, vis_model: np.ndarray,
                 antenna1: np.ndarray, antenna2: np.ndarray, n_ant: int) -> np.ndarray:
@@ -196,8 +207,20 @@ class Xf(JonesEffect):
         antenna1 = np.ascontiguousarray(antenna1, dtype=np.int32)
         antenna2 = np.ascontiguousarray(antenna2, dtype=np.int32)
 
-        # Initial guess: phase = 0 for ALL antennas (no reference antenna special case)
-        p0 = np.zeros(n_ant, dtype=np.float64)
+        # Compute initial guess using direct chain method
+        logger.info("  Computing initial guess from direct chain method...")
+        jones_init = compute_initial_jones_chain(
+            vis_obs, vis_model, antenna1, antenna2,
+            n_ant, ref_ant=0, flags=None, verbose=False
+        )
+
+        # Set diagonal to 1, extract cross-hand phase
+        jones_init[:, 0, 0] = 1.0
+        # jones_init[:, 1, 1] already has cross-hand phase estimate
+
+        # Extract params for optimizer (all antennas)
+        p0 = _xf_jones_to_params(jones_init)
+        logger.info(f"  Initial guess: φ range = [{np.min(p0)*180/np.pi:.1f}, {np.max(p0)*180/np.pi:.1f}] deg")
 
         def residual(p):
             return _xf_residual(p, vis_obs, vis_model, antenna1, antenna2, n_ant)

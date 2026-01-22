@@ -275,6 +275,70 @@ def cleanup_arrays(*arrays):
     gc.collect()
 
 
+def compute_batch_plan(
+    total_time_seconds: float,
+    time_interval_seconds: float,
+    n_baseline: int,
+    n_chan: int,
+    available_ram_gb: float,
+    safety_factor: float = 0.7
+) -> Tuple[int, int, str]:
+    """
+    Compute optimal batch size for chunked loading.
+
+    Parameters
+    ----------
+    total_time_seconds : float
+        Total observation time
+    time_interval_seconds : float
+        Time interval per solint chunk
+    n_baseline : int
+        Number of baselines
+    n_chan : int
+        Number of channels
+    available_ram_gb : float
+        Available RAM in GB
+    safety_factor : float
+        Use only this fraction of available RAM (default: 0.7 = 70%)
+
+    Returns
+    -------
+    n_chunks_total : int
+        Total number of time chunks needed
+    n_chunks_per_batch : int
+        Number of chunks to load per batch
+    plan_str : str
+        Human-readable plan description
+    """
+    # Calculate total chunks
+    n_chunks_total = int(np.ceil(total_time_seconds / time_interval_seconds))
+
+    # Memory per time chunk (in GB)
+    # vis_obs + vis_model + flags + metadata
+    rows_per_chunk = int(n_baseline * time_interval_seconds / 10)  # Assume ~10s integrations
+    bytes_per_chunk = rows_per_chunk * n_chan * 4 * 16 * 2  # 2 = vis + model
+    bytes_per_chunk += rows_per_chunk * n_chan * 4  # flags
+    bytes_per_chunk = int(bytes_per_chunk * 1.5)  # 50% overhead
+
+    mem_per_chunk_gb = bytes_per_chunk / (1024**3)
+
+    # How many chunks fit in RAM?
+    usable_ram_gb = available_ram_gb * safety_factor
+    n_chunks_per_batch = int(usable_ram_gb / max(mem_per_chunk_gb, 0.1))
+    n_chunks_per_batch = max(1, min(n_chunks_per_batch, n_chunks_total))
+
+    # Number of batches needed
+    n_batches = int(np.ceil(n_chunks_total / n_chunks_per_batch))
+
+    # Build plan string
+    if n_batches == 1:
+        plan_str = f"Loading all {n_chunks_total} chunks ({mem_per_chunk_gb * n_chunks_total:.1f} GB)"
+    else:
+        plan_str = f"Loading in {n_batches} batches: {n_chunks_per_batch} chunks/batch (~{mem_per_chunk_gb * n_chunks_per_batch:.1f} GB), {usable_ram_gb:.1f} GB available"
+
+    return n_chunks_total, n_chunks_per_batch, plan_str
+
+
 def print_memory_info(label: str = ""):
     """Print current memory usage."""
     if not HAS_PSUTIL:

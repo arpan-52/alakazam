@@ -401,6 +401,136 @@ def create_source_freq_grid(n_sol_freq: int, freq_array: np.ndarray) -> np.ndarr
     return np.array(freq_centers)
 
 
+def fill_flagged_from_valid(
+    jones: np.ndarray,
+    weights: np.ndarray,
+    time: np.ndarray = None,
+    freq: np.ndarray = None,
+    method: InterpMethod = 'linear'
+) -> np.ndarray:
+    """
+    Fill flagged (weight=0) Jones chunks by interpolating from valid (weight>0) neighbors.
+
+    Interpolates in both time and frequency dimensions to fill bad chunks.
+
+    Parameters
+    ----------
+    jones : ndarray
+        Jones matrices, shape (n_time, n_freq, n_ant, 2, 2)
+    weights : ndarray
+        Weights array, shape (n_time, n_freq), 1.0=valid, 0.0=flagged
+    time : ndarray, optional
+        Time coordinates (n_time,), for proper interpolation
+    freq : ndarray, optional
+        Frequency coordinates (n_freq,), for proper interpolation
+    method : str
+        Interpolation method: 'nearest', 'linear', 'cubic'
+
+    Returns
+    -------
+    jones_filled : ndarray
+        Jones with flagged chunks filled by interpolation
+    """
+    jones_filled = jones.copy()
+    n_time, n_freq, n_ant = jones.shape[:3]
+
+    # If all weights are 1, nothing to do
+    if np.all(weights > 0):
+        return jones_filled
+
+    # Time interpolation: for each freq, interpolate across time
+    if n_time > 1 and time is not None:
+        for f in range(n_freq):
+            # Find valid time points for this freq
+            valid_t = weights[:, f] > 0
+            if np.sum(valid_t) == 0:
+                # No valid points at this freq, skip
+                continue
+            if np.sum(valid_t) == n_time:
+                # All valid, skip
+                continue
+
+            valid_time = time[valid_t]
+
+            # Interpolate each antenna and matrix element
+            for a in range(n_ant):
+                for i in range(2):
+                    for j in range(2):
+                        valid_vals = jones[valid_t, f, a, i, j]
+
+                        # Interpolate real and imaginary separately
+                        if method == 'nearest':
+                            # Find nearest valid point for each invalid point
+                            for t in range(n_time):
+                                if weights[t, f] == 0:
+                                    idx = np.argmin(np.abs(valid_time - time[t]))
+                                    jones_filled[t, f, a, i, j] = valid_vals[idx]
+                        else:
+                            # Use scipy interp1d
+                            if len(valid_time) >= 2:
+                                f_real = interp1d(valid_time, valid_vals.real, kind=method,
+                                                bounds_error=False, fill_value='extrapolate')
+                                f_imag = interp1d(valid_time, valid_vals.imag, kind=method,
+                                                bounds_error=False, fill_value='extrapolate')
+
+                                # Fill invalid points
+                                for t in range(n_time):
+                                    if weights[t, f] == 0:
+                                        jones_filled[t, f, a, i, j] = f_real(time[t]) + 1j * f_imag(time[t])
+                            elif len(valid_time) == 1:
+                                # Only one valid point, use it for all invalid
+                                for t in range(n_time):
+                                    if weights[t, f] == 0:
+                                        jones_filled[t, f, a, i, j] = valid_vals[0]
+
+    # Frequency interpolation: for each time, interpolate across freq
+    if n_freq > 1 and freq is not None:
+        for t in range(n_time):
+            # Find valid freq points for this time
+            valid_f = weights[t, :] > 0
+            if np.sum(valid_f) == 0:
+                # No valid points at this time, skip
+                continue
+            if np.sum(valid_f) == n_freq:
+                # All valid, skip
+                continue
+
+            valid_freq = freq[valid_f]
+
+            # Interpolate each antenna and matrix element
+            for a in range(n_ant):
+                for i in range(2):
+                    for j in range(2):
+                        valid_vals = jones_filled[t, valid_f, a, i, j]
+
+                        # Interpolate real and imaginary separately
+                        if method == 'nearest':
+                            # Find nearest valid point for each invalid point
+                            for f in range(n_freq):
+                                if weights[t, f] == 0:
+                                    idx = np.argmin(np.abs(valid_freq - freq[f]))
+                                    jones_filled[t, f, a, i, j] = valid_vals[idx]
+                        else:
+                            # Use scipy interp1d
+                            if len(valid_freq) >= 2:
+                                f_real = interp1d(valid_freq, valid_vals.real, kind=method,
+                                                bounds_error=False, fill_value='extrapolate')
+                                f_imag = interp1d(valid_freq, valid_vals.imag, kind=method,
+                                                bounds_error=False, fill_value='extrapolate')
+
+                                # Fill invalid points
+                                for f in range(n_freq):
+                                    if weights[t, f] == 0:
+                                        jones_filled[t, f, a, i, j] = f_real(freq[f]) + 1j * f_imag(freq[f])
+                            elif len(valid_freq) == 1:
+                                # Only one valid point, use it for all invalid
+                                for f in range(n_freq):
+                                    if weights[t, f] == 0:
+                                        jones_filled[t, f, a, i, j] = valid_vals[0]
+
+    return jones_filled
+
+
 def log_interpolation_info(
     jones_type: str,
     source_shape: Tuple[int, int, int],
@@ -440,6 +570,7 @@ __all__ = [
     'interpolate_jones_time_array',
     'interpolate_jones_freq',
     'interpolate_jones_to_chunk',
+    'fill_flagged_from_valid',
     'get_chunk_time_center',
     'create_source_time_grid',
     'create_source_freq_grid',
