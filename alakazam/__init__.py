@@ -98,8 +98,8 @@ from .jones.crosshand import Xf, Kcross
 # I/O
 from .io import save_jones, load_jones, list_jones, print_summary, write_solution_hdf5, read_solution_hdf5
 
-# Config I/O
-from .config_io import config_to_yaml, config_from_yaml, solve_from_yaml
+# Config I/O (parsed via pipeline YAML handling)
+# config_io module not yet implemented; use run_pipeline() or parse_config() directly
 
 # Pipeline
 from .pipeline import run_pipeline, quick_solve
@@ -147,10 +147,6 @@ __all__ = [
     'print_summary',
     'write_solution_hdf5',
     'read_solution_hdf5',
-    # Config I/O
-    'config_to_yaml',
-    'config_from_yaml',
-    'solve_from_yaml',
     # Pipeline
     'run_pipeline',
     'quick_solve',
