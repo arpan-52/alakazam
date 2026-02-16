@@ -1,427 +1,236 @@
 """
-K Delay Solver - Frequency-dependent antenna delays.
+ALAKAZAM K (Delay) Solver.
 
-Jones Matrix:
-  K = diag(exp(-2πi τ_x ν), exp(-2πi τ_y ν))
+Solves for antenna-based delays: K(ν) = diag(exp(-2πi τ_p ν), exp(-2πi τ_q ν))
+Uses parallel-hand correlations (XX,YY / RR,LL).
+Frequency axis is kept — never averaged.
 
-Reference Constraint:
-  J_ref = I (identity)
-
-Parameters:
-  [τ_x, τ_y] per antenna in nanoseconds
-
-Averaging:
-  - Time: YES (average over solint)
-  - Freq: NO (need full freq for phase slope fitting)
-
-Chain Initial Guess:
-  For each frequency:
-    J_j(ν) = V_ref,j(ν) / M_ref,j(ν)  (since J_ref = I)
-    φ_j(ν) = angle(J_j(ν))
-  Fit: τ_j = -d(φ_j)/d(ν) / (2π)
+Developed by Arpan Pal 2026, NRAO / NCRA
 """
 
 import numpy as np
-from scipy.optimize import least_squares
 from numba import njit, prange
-from typing import Dict, Any
+from typing import Dict, Optional, Tuple
+from . import JonesSolver, build_antenna_graph, bfs_order
+import logging
 
-from .base import JonesSolverBase, SolverMetadata
-from .utils import fit_phase_slope_weighted, find_ref_baselines
+logger = logging.getLogger("alakazam")
+
+
+# ---------------------------------------------------------------------------
+# Numba kernels
+# ---------------------------------------------------------------------------
+
+@njit(cache=True)
+def _fit_delay_from_phase(phase, freq):
+    """Linear fit: phase = -2π τ ν → extract τ in nanoseconds.
+
+    phase: (n_freq,) float64  — unwrapped phase in radians
+    freq:  (n_freq,) float64  — Hz
+    Returns: delay in nanoseconds
+    """
+    n = len(freq)
+    if n < 2:
+        return 0.0
+    # Weighted least squares: φ = a · ν + b
+    # We want a = -2π τ  →  τ = -a / (2π)
+    sum_f = 0.0
+    sum_p = 0.0
+    sum_ff = 0.0
+    sum_fp = 0.0
+    for i in range(n):
+        sum_f += freq[i]
+        sum_p += phase[i]
+        sum_ff += freq[i] * freq[i]
+        sum_fp += freq[i] * phase[i]
+    denom = n * sum_ff - sum_f * sum_f
+    if abs(denom) < 1e-30:
+        return 0.0
+    slope = (n * sum_fp - sum_f * sum_p) / denom
+    tau_sec = -slope / (2.0 * np.pi)
+    return tau_sec * 1e9  # seconds → nanoseconds
 
 
 @njit(cache=True)
-def _fit_delay_jit(phase: np.ndarray, freq: np.ndarray) -> float:
-    """
-    JIT-compiled delay fitting from phase slope.
-
-    Linear fit: φ = -2π × τ × ν
-    Return: τ in nanoseconds
-    """
+def _unwrap_phase(phase):
+    """Simple phase unwrapping."""
     n = len(phase)
-    if n < 3:
-        return 0.0
-
-    # Weighted linear fit
-    freq_mean = np.mean(freq)
-    phase_mean = np.mean(phase)
-
-    numerator = np.sum((freq - freq_mean) * (phase - phase_mean))
-    denominator = np.sum((freq - freq_mean) ** 2)
-
-    if denominator < 1e-20:
-        return 0.0
-
-    # Slope in rad/Hz
-    slope = numerator / denominator
-
-    # Convert to delay in nanoseconds
-    # φ = -2π × τ × ν  →  τ = -slope / (2π)
-    delay_s = -slope / (2.0 * np.pi)
-    delay_ns = delay_s * 1e9
-
-    return delay_ns
+    out = np.empty(n, dtype=np.float64)
+    out[0] = phase[0]
+    for i in range(1, n):
+        diff = phase[i] - phase[i - 1]
+        while diff > np.pi:
+            diff -= 2 * np.pi
+        while diff < -np.pi:
+            diff += 2 * np.pi
+        out[i] = out[i - 1] + diff
+    return out
 
 
 @njit(parallel=True, cache=True)
-def _chain_delays_jit(
-    vis_obs: np.ndarray,
-    vis_model: np.ndarray,
-    antenna1: np.ndarray,
-    antenna2: np.ndarray,
-    freq: np.ndarray,
-    flags: np.ndarray,
-    ref_ant: int,
-    n_ant: int
-) -> np.ndarray:
+def _k_residual(delay_params, vis_obs, vis_model, ant1, ant2,
+                n_ant, ref_ant, working_ants, freq):
+    """Residual function for K delay solver.
+
+    delay_params: flat real vector [(n_working-1) * 2]
+    vis_obs:      (n_bl, n_freq, 2, 2) complex128
+    vis_model:    (n_bl, n_freq, 2, 2) complex128
+    freq:         (n_freq,) float64 Hz
+    Returns:      (n_bl * n_freq * 4,) float64
     """
-    JIT-compiled chain solver for K delays.
+    n_bl = vis_obs.shape[0]
+    n_freq = vis_obs.shape[1]
+    n_working = len(working_ants)
 
-    For J_ref = I:
-      J_j(ν) = V_ref,j(ν) / M_ref,j(ν)
-      φ_j(ν) = angle(J_j(ν))
-      τ_j = fit delay from φ_j vs ν
-
-    Parameters
-    ----------
-    vis_obs, vis_model : ndarray (n_bl, n_freq, 2, 2)
-        Visibilities
-    antenna1, antenna2 : ndarray (n_bl,)
-        Antenna indices
-    freq : ndarray (n_freq,)
-        Frequencies in Hz
-    flags : ndarray (n_bl, n_freq, 2, 2)
-        Flags
-    ref_ant : int
-        Reference antenna
-    n_ant : int
-        Number of antennas
-
-    Returns
-    -------
-    delays : ndarray (n_ant, 2)
-        Initial delays in nanoseconds [τ_x, τ_y]
-    """
-    delays = np.zeros((n_ant, 2), dtype=np.float64)
-    n_bl = len(antenna1)
-    n_freq = len(freq)
-
-    # Process baselines in parallel
-    for bl in prange(n_bl):
-        a1 = antenna1[bl]
-        a2 = antenna2[bl]
-
-        # Check if this baseline contains reference
-        if a1 == ref_ant:
-            ant_j = a2
-            flip = False
-        elif a2 == ref_ant:
-            ant_j = a1
-            flip = True
-        else:
+    # Build delay array (n_ant, 2)
+    delay = np.zeros((n_ant, 2), dtype=np.float64)
+    idx = 0
+    for w in range(n_working):
+        a = working_ants[w]
+        if a == ref_ant:
             continue
+        delay[a, 0] = delay_params[idx]
+        delay[a, 1] = delay_params[idx + 1]
+        idx += 2
 
-        # For each polarization
-        for p in range(2):
-            # Extract vis for this baseline and pol
-            V = vis_obs[bl, :, p, p]
-            M = vis_model[bl, :, p, p]
-            F = flags[bl, :, p, p]
+    # Compute residuals
+    residual = np.empty(n_bl * n_freq * 4, dtype=np.float64)
+    for bl in prange(n_bl):
+        a1 = ant1[bl]
+        a2 = ant2[bl]
+        for f in range(n_freq):
+            # K Jones elements
+            k_a1_p = np.exp(-2j * np.pi * delay[a1, 0] * 1e-9 * freq[f])
+            k_a1_q = np.exp(-2j * np.pi * delay[a1, 1] * 1e-9 * freq[f])
+            k_a2_p = np.exp(-2j * np.pi * delay[a2, 0] * 1e-9 * freq[f])
+            k_a2_q = np.exp(-2j * np.pi * delay[a2, 1] * 1e-9 * freq[f])
 
-            # Build mask for valid data
-            valid = np.zeros(n_freq, dtype=np.bool_)
-            for f in range(n_freq):
-                if not F[f] and np.abs(M[f]) > 1e-10 and np.isfinite(V[f]) and np.isfinite(M[f]):
-                    valid[f] = True
+            # pp residual
+            diff_pp = vis_obs[bl, f, 0, 0] - k_a1_p * vis_model[bl, f, 0, 0] * np.conj(k_a2_p)
+            # qq residual
+            diff_qq = vis_obs[bl, f, 1, 1] - k_a1_q * vis_model[bl, f, 1, 1] * np.conj(k_a2_q)
 
-            n_valid = np.sum(valid)
-            if n_valid < 10:
-                continue
+            r_idx = (bl * n_freq + f) * 4
+            residual[r_idx + 0] = diff_pp.real
+            residual[r_idx + 1] = diff_pp.imag
+            residual[r_idx + 2] = diff_qq.real
+            residual[r_idx + 3] = diff_qq.imag
 
-            # Extract valid data
-            V_valid = np.zeros(n_valid, dtype=np.complex128)
-            M_valid = np.zeros(n_valid, dtype=np.complex128)
-            freq_valid = np.zeros(n_valid, dtype=np.float64)
-            idx = 0
-            for f in range(n_freq):
-                if valid[f]:
-                    V_valid[idx] = V[f]
-                    M_valid[idx] = M[f]
-                    freq_valid[idx] = freq[f]
-                    idx += 1
-
-            # Chain solve: J_j = V / M
-            if flip:
-                J_j = np.conj(V_valid / M_valid)
-            else:
-                J_j = V_valid / M_valid
-
-            # Extract phase and unwrap
-            phase = np.angle(J_j)
-            # Simple unwrapping (numba doesn't have np.unwrap)
-            phase_unwrap = np.zeros(n_valid, dtype=np.float64)
-            phase_unwrap[0] = phase[0]
-            for i in range(1, n_valid):
-                diff = phase[i] - phase_unwrap[i-1]
-                # Unwrap by adding/subtracting 2π
-                if diff > np.pi:
-                    phase_unwrap[i] = phase[i] - 2*np.pi
-                elif diff < -np.pi:
-                    phase_unwrap[i] = phase[i] + 2*np.pi
-                else:
-                    phase_unwrap[i] = phase[i]
-
-            # Fit delay
-            delay_ns = _fit_delay_jit(phase_unwrap, freq_valid)
-            delays[ant_j, p] = delay_ns
-
-    return delays
+    return residual
 
 
-class KDelaySolver(JonesSolverBase):
-    """K delay solver."""
+class KDelaySolver(JonesSolver):
+    """K (Delay) solver."""
 
-    metadata = SolverMetadata(
-        jones_type='K',
-        ref_constraint='identity',
-        can_avg_time=True,
-        can_avg_freq=False,  # Need full freq for delay fitting
-        description="Antenna delays from phase slope across frequency"
-    )
+    jones_type = "K"
+    can_avg_freq = False
+    correlations = "parallel"
+    ref_constraint = "identity"
+
+    def n_params(self, n_working: int, n_freq: int = 1,
+                 phase_only: bool = False) -> int:
+        return (n_working - 1) * 2
 
     def chain_initial_guess(
-        self,
-        vis_obs: np.ndarray,
-        vis_model: np.ndarray,
-        antenna1: np.ndarray,
-        antenna2: np.ndarray,
-        freq: np.ndarray,
-        flags: np.ndarray,
-        ref_ant: int,
-        n_ant: int,
-        **kwargs
-    ) -> np.ndarray:
-        """
-        Chain solver for K delays (JIT-accelerated).
+        self, vis_avg, model_avg, ant1, ant2,
+        n_ant, ref_ant, working_ants, freq=None, phase_only=False,
+    ):
+        """Chain solver: phase slope fit on ref baselines, BFS propagation."""
+        if freq is None:
+            raise ValueError("K solver requires freq array")
 
-        For J_ref = I:
-          J_j(ν) = V_ref,j(ν) / M_ref,j(ν)
-          φ_j(ν) = angle(J_j(ν))
-          τ_j = fit delay from φ_j vs ν
+        delay = np.zeros((n_ant, 2), dtype=np.float64)
+        graph = build_antenna_graph(ant1, ant2, n_ant)
+        order = bfs_order(graph, ref_ant, working_ants)
 
-        Parameters
-        ----------
-        vis_obs, vis_model : ndarray (n_bl, n_freq, 2, 2)
-            Observed and model visibilities
-        freq : ndarray (n_freq,)
-            Frequencies in Hz
-        flags : ndarray (n_bl, n_freq, 2, 2)
-            Flags
+        for (ant, parent, bl_idx, is_parent_ant1) in order:
+            # Get visibility for this baseline
+            if vis_avg.ndim == 4:
+                V = vis_avg[bl_idx]   # (n_freq, 2, 2)
+                M = model_avg[bl_idx]
+            else:
+                continue
 
-        Returns
-        -------
-        delays_init : ndarray (n_ant, 2)
-            Initial delays in nanoseconds [τ_x, τ_y]
-        """
-        # Count reference baselines for logging
-        if self.verbose:
-            n_ref_bl = np.sum((antenna1 == ref_ant) | (antenna2 == ref_ant))
-            print(f"[ALAKAZAM] Chain initial guess: {n_ref_bl} ref baselines (JIT-accelerated)")
+            for pol in range(2):
+                # ratio = V / M
+                ratio = np.zeros(len(freq), dtype=np.complex128)
+                for f in range(len(freq)):
+                    m_val = M[f, pol, pol]
+                    if np.abs(m_val) > 1e-20:
+                        ratio[f] = V[f, pol, pol] / m_val
+                    else:
+                        ratio[f] = 0.0
 
-        # Call JIT-compiled chain solver
-        delays_init = _chain_delays_jit(
-            vis_obs, vis_model, antenna1, antenna2, freq, flags, ref_ant, n_ant
-        )
+                # Remove parent delay contribution
+                parent_delay = delay[parent, pol] * 1e-9  # ns → s
+                for f in range(len(freq)):
+                    if is_parent_ant1:
+                        # parent is ant1: V = K_parent * M * K_ant^H
+                        # ratio = K_parent * K_ant^H = exp(-2πi(τ_par - τ_ant)ν)
+                        ratio[f] *= np.exp(2j * np.pi * parent_delay * freq[f])
+                    else:
+                        # parent is ant2: V = K_ant * M * K_parent^H
+                        # ratio = K_ant * K_parent^H = exp(-2πi(τ_ant - τ_par)ν)
+                        ratio[f] *= np.exp(2j * np.pi * parent_delay * freq[f])
 
-        return delays_init
+                # Extract phase and fit delay
+                phase = np.angle(ratio)
+                phase_uw = _unwrap_phase(phase)
+                tau = _fit_delay_from_phase(phase_uw, freq)
 
-    def residual(
-        self,
-        params: np.ndarray,
-        vis_obs: np.ndarray,
-        vis_model: np.ndarray,
-        antenna1: np.ndarray,
-        antenna2: np.ndarray,
-        freq: np.ndarray,
-        flags: np.ndarray,
-        n_ant: int,
-        ref_ant: int,
-        **kwargs
-    ) -> np.ndarray:
-        """
-        Compute residuals for K delay optimization.
+                if is_parent_ant1:
+                    # ratio after parent removal ≈ exp(+2πi τ_ant ν)
+                    delay[ant, pol] = -tau
+                else:
+                    delay[ant, pol] = tau
 
-        Apply K delays to model and compute complex residuals.
-        """
-        # Unpack delays
-        delays = self.unpack_params(params, n_ant, ref_ant)
+        # Pack
+        return self._pack_delay(delay, ref_ant, working_ants)
 
-        # Compute residuals
-        residuals = _k_delay_residual(
-            delays, vis_obs, vis_model, antenna1, antenna2, freq, flags
-        )
-
-        return residuals
-
-    def pack_params(
-        self,
-        jones: np.ndarray,
-        ref_ant: int,
-        **kwargs
-    ) -> np.ndarray:
-        """
-        Pack delays to parameter array.
-
-        jones : ndarray (n_ant, 2)
-            Delays [τ_x, τ_y] in nanoseconds
-
-        Returns params excluding reference antenna.
-        """
-        n_ant = jones.shape[0]
+    def _pack_delay(self, delay, ref_ant, working_ants):
+        """Pack delay array to parameter vector."""
         params = []
-
-        for ant in range(n_ant):
-            if ant != ref_ant:
-                params.extend([jones[ant, 0], jones[ant, 1]])
-
+        for a in working_ants:
+            if a == ref_ant:
+                continue
+            params.append(delay[a, 0])
+            params.append(delay[a, 1])
         return np.array(params, dtype=np.float64)
 
-    def unpack_params(
-        self,
-        params: np.ndarray,
-        n_ant: int,
-        ref_ant: int,
-        **kwargs
-    ) -> np.ndarray:
-        """
-        Unpack parameters to delays.
-
-        Returns delays (n_ant, 2) with ref=0.
-        """
-        delays = np.zeros((n_ant, 2), dtype=np.float64)
+    def _unpack_delay(self, params, n_ant, ref_ant, working_ants):
+        """Unpack parameter vector to delay array."""
+        delay = np.full((n_ant, 2), np.nan, dtype=np.float64)
+        delay[ref_ant, :] = 0.0
         idx = 0
+        for a in working_ants:
+            if a == ref_ant:
+                continue
+            delay[a, 0] = params[idx]
+            delay[a, 1] = params[idx + 1]
+            idx += 2
+        return delay
 
-        for ant in range(n_ant):
-            if ant != ref_ant:
-                delays[ant, 0] = params[idx]
-                delays[ant, 1] = params[idx + 1]
-                idx += 2
+    def pack_params(self, jones, n_ant, ref_ant, working_ants, phase_only=False):
+        # Extract delays from Jones (not typically called directly)
+        raise NotImplementedError("Use _pack_delay for K solver")
 
-        return delays
+    def unpack_params(self, params, n_ant, ref_ant, working_ants,
+                      freq=None, phase_only=False):
+        """Unpack to Jones matrices (n_ant, n_freq, 2, 2)."""
+        delay = self._unpack_delay(params, n_ant, ref_ant, working_ants)
+        if freq is None:
+            raise ValueError("K solver requires freq for unpack_params")
+        from ..jones import delay_to_jones
+        return delay_to_jones(delay, freq)
 
-    def print_solution(
-        self,
-        jones: np.ndarray,
-        working_ants: np.ndarray,
-        ref_ant: int,
-        convergence_info: Dict[str, Any]
-    ):
-        """Print K delay solution."""
-        if not self.verbose:
-            return
+    def residual_func(self, params, vis_avg, model_avg, ant1, ant2,
+                      n_ant, ref_ant, working_ants, freq=None,
+                      phase_only=False):
+        if freq is None:
+            raise ValueError("K solver requires freq")
+        return _k_residual(params, vis_avg, model_avg, ant1, ant2,
+                           n_ant, ref_ant, working_ants, freq)
 
-        delays = jones  # (n_working, 2)
-
-        print(f"[ALAKAZAM] Cost: {convergence_info['cost_init']:.4e} -> {convergence_info['cost_final']:.4e}")
-        print(f"[ALAKAZAM] Final delays (ns):")
-
-        for i in range(len(working_ants)):
-            ant_full = working_ants[i]
-            status = "[ref]" if ant_full == ref_ant else ""
-            print(f"        Ant {ant_full:2d}: X={delays[i, 0]:+8.3f}, Y={delays[i, 1]:+8.3f}  {status}")
-
-
-@njit(cache=True)
-def _k_delay_residual(
-    delays: np.ndarray,
-    vis_obs: np.ndarray,
-    vis_model: np.ndarray,
-    antenna1: np.ndarray,
-    antenna2: np.ndarray,
-    freq: np.ndarray,
-    flags: np.ndarray
-) -> np.ndarray:
-    """
-    Compute residuals for K delay solver.
-
-    Numba-compiled for speed.
-
-    Parameters
-    ----------
-    delays : ndarray (n_ant, 2)
-        Delays [τ_x, τ_y] in nanoseconds
-    vis_obs, vis_model : ndarray (n_bl, n_freq, 2, 2)
-        Visibilities
-    antenna1, antenna2 : ndarray (n_bl,)
-        Antenna indices
-    freq : ndarray (n_freq,)
-        Frequencies in Hz
-    flags : ndarray (n_bl, n_freq, 2, 2)
-        Flags (True = flagged)
-
-    Returns
-    -------
-    residuals : ndarray
-        Flattened real residuals for unflagged data
-    """
-    n_bl = len(antenna1)
-    n_freq = len(freq)
-
-    # Count unflagged data points
-    n_unflagged = 0
-    for bl in range(n_bl):
-        for ch in range(n_freq):
-            if not flags[bl, ch, 0, 0]:
-                n_unflagged += 1
-            if not flags[bl, ch, 1, 1]:
-                n_unflagged += 1
-
-    # Allocate residual array (2 values per unflagged correlation: real + imag)
-    residuals = np.zeros(n_unflagged * 2, dtype=np.float64)
-    res_idx = 0
-
-    # For each baseline and frequency
-    for bl in range(n_bl):
-        a1 = antenna1[bl]
-        a2 = antenna2[bl]
-
-        for ch in range(n_freq):
-            f = freq[ch]
-
-            # Compute Jones matrices
-            # K = exp(-2πi × τ × ν)
-            phase_x1 = -2.0 * np.pi * delays[a1, 0] * f * 1e-9
-            phase_y1 = -2.0 * np.pi * delays[a1, 1] * f * 1e-9
-            phase_x2 = -2.0 * np.pi * delays[a2, 0] * f * 1e-9
-            phase_y2 = -2.0 * np.pi * delays[a2, 1] * f * 1e-9
-
-            K1_x = np.exp(1j * phase_x1)
-            K1_y = np.exp(1j * phase_y1)
-            K2_x = np.exp(1j * phase_x2)
-            K2_y = np.exp(1j * phase_y2)
-
-            # Apply K to model: V' = K1 × M × K2^H
-            # XX correlation
-            if not flags[bl, ch, 0, 0]:
-                M_xx = vis_model[bl, ch, 0, 0]
-                V_predicted = K1_x * M_xx * np.conj(K2_x)
-                V_observed = vis_obs[bl, ch, 0, 0]
-
-                residuals[res_idx] = (V_observed - V_predicted).real
-                residuals[res_idx + 1] = (V_observed - V_predicted).imag
-                res_idx += 2
-
-            # YY correlation
-            if not flags[bl, ch, 1, 1]:
-                M_yy = vis_model[bl, ch, 1, 1]
-                V_predicted = K1_y * M_yy * np.conj(K2_y)
-                V_observed = vis_obs[bl, ch, 1, 1]
-
-                residuals[res_idx] = (V_observed - V_predicted).real
-                residuals[res_idx + 1] = (V_observed - V_predicted).imag
-                res_idx += 2
-
-    return residuals
-
-
-__all__ = ['KDelaySolver']
+    def get_native_params(self, params, n_ant, ref_ant, working_ants, freq=None):
+        delay = self._unpack_delay(params, n_ant, ref_ant, working_ants)
+        return {"delay": delay}

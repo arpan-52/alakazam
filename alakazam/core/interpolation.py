@@ -1,579 +1,164 @@
 """
-Jones Interpolation Module.
+ALAKAZAM Jones Interpolation.
 
-Interpolates Jones solutions to different time/frequency grids.
-Used when applying pre-solved Jones with different solution intervals.
+Interpolates Jones solutions from solution grid to target grid.
+Uses amplitude/phase interpolation for diagonal Jones (not real/imag).
+Uses nearest-neighbor for off-diagonal (leakage) terms.
+
+Developed by Arpan Pal 2026, NRAO / NCRA
 """
 
 import numpy as np
-from typing import Tuple, Literal
-from scipy.interpolate import interp1d
+from typing import Optional
 import logging
 
-logger = logging.getLogger('ALAKAZAM')
-
-InterpMethod = Literal['nearest', 'linear', 'cubic']
+logger = logging.getLogger("alakazam")
 
 
 def interpolate_jones_time(
     jones: np.ndarray,
-    time_src: np.ndarray,
-    time_tgt: float,
-    method: InterpMethod = 'linear'
+    sol_times: np.ndarray,
+    target_times: np.ndarray,
+    flags: Optional[np.ndarray] = None,
+    method: str = "amp_phase",
 ) -> np.ndarray:
+    """Interpolate Jones matrices in time.
+
+    jones:        (n_sol_time, n_ant, 2, 2) complex128
+    sol_times:    (n_sol_time,) float64
+    target_times: (n_target,) float64
+    flags:        (n_sol_time, n_ant) bool, optional
+
+    Returns: (n_target, n_ant, 2, 2) complex128
     """
-    Interpolate Jones matrices in time dimension.
+    n_sol = jones.shape[0]
+    n_ant = jones.shape[1]
+    n_target = len(target_times)
 
-    Parameters
-    ----------
-    jones : ndarray
-        Source Jones matrices (n_time_src, n_freq, n_ant, 2, 2)
-    time_src : ndarray
-        Source time points (n_time_src,)
-    time_tgt : float
-        Target time point (scalar)
-    method : str
-        Interpolation method: 'nearest', 'linear', 'cubic'
+    if n_sol == 1:
+        return np.broadcast_to(jones[0], (n_target, n_ant, 2, 2)).copy()
 
-    Returns
-    -------
-    jones_interp : ndarray
-        Interpolated Jones (n_freq, n_ant, 2, 2)
-    """
-    n_time_src, n_freq, n_ant = jones.shape[:3]
+    result = np.empty((n_target, n_ant, 2, 2), dtype=np.complex128)
 
-    if n_time_src == 1:
-        # Only one time point, return it
-        return jones[0]
-
-    if method == 'nearest':
-        # Find nearest time
-        idx = np.argmin(np.abs(time_src - time_tgt))
-        return jones[idx]
-
-    elif method in ('linear', 'cubic'):
-        # Interpolate real and imaginary parts separately
-        jones_interp = np.zeros((n_freq, n_ant, 2, 2), dtype=np.complex128)
-
-        for f in range(n_freq):
-            for a in range(n_ant):
-                for i in range(2):
-                    for j in range(2):
-                        # Real part
-                        f_real = interp1d(
-                            time_src,
-                            jones[:, f, a, i, j].real,
-                            kind=method,
-                            bounds_error=False,
-                            fill_value='extrapolate'
-                        )
-
-                        # Imaginary part
-                        f_imag = interp1d(
-                            time_src,
-                            jones[:, f, a, i, j].imag,
-                            kind=method,
-                            bounds_error=False,
-                            fill_value='extrapolate'
-                        )
-
-                        jones_interp[f, a, i, j] = f_real(time_tgt) + 1j * f_imag(time_tgt)
-
-        return jones_interp
-
-    else:
-        raise ValueError(f"Unknown interpolation method: {method}")
-
-
-def interpolate_jones_time_array(
-    jones: np.ndarray,
-    time_src: np.ndarray,
-    time_tgt: np.ndarray,
-    method: InterpMethod = 'linear'
-) -> np.ndarray:
-    """
-    Interpolate Jones matrices to multiple target times.
-
-    Parameters
-    ----------
-    jones : ndarray
-        Source Jones matrices (n_time_src, n_ant, 2, 2) or (n_time_src, n_freq, n_ant, 2, 2)
-    time_src : ndarray
-        Source time points (n_time_src,)
-    time_tgt : ndarray
-        Target time points (n_time_tgt,)
-    method : str
-        Interpolation method: 'nearest', 'linear', 'cubic'
-
-    Returns
-    -------
-    jones_interp : ndarray
-        Interpolated Jones (n_time_tgt, n_ant, 2, 2) or (n_time_tgt, n_freq, n_ant, 2, 2)
-    """
-    n_time_src = jones.shape[0]
-    n_time_tgt = len(time_tgt)
-
-    if n_time_src == 1:
-        # Only one time point, replicate
-        return np.tile(jones, (n_time_tgt,) + (1,) * (jones.ndim - 1))
-
-    if n_time_src == n_time_tgt and np.allclose(time_src, time_tgt):
-        # Times match
-        return jones
-
-    if method == 'nearest':
-        # Find nearest times
-        jones_interp = np.zeros((n_time_tgt,) + jones.shape[1:], dtype=np.complex128)
-        for t_idx, t in enumerate(time_tgt):
-            src_idx = np.argmin(np.abs(time_src - t))
-            jones_interp[t_idx] = jones[src_idx]
-        return jones_interp
-
-    elif method in ('linear', 'cubic'):
-        # Handle both (n_time, n_ant, 2, 2) and (n_time, n_freq, n_ant, 2, 2)
-        if jones.ndim == 4:
-            # (n_time_src, n_ant, 2, 2)
-            n_ant = jones.shape[1]
-            jones_interp = np.zeros((n_time_tgt, n_ant, 2, 2), dtype=np.complex128)
-
-            for a in range(n_ant):
-                for i in range(2):
-                    for j in range(2):
-                        # Real part
-                        f_real = interp1d(
-                            time_src,
-                            jones[:, a, i, j].real,
-                            kind=method,
-                            bounds_error=False,
-                            fill_value='extrapolate'
-                        )
-
-                        # Imaginary part
-                        f_imag = interp1d(
-                            time_src,
-                            jones[:, a, i, j].imag,
-                            kind=method,
-                            bounds_error=False,
-                            fill_value='extrapolate'
-                        )
-
-                        jones_interp[:, a, i, j] = f_real(time_tgt) + 1j * f_imag(time_tgt)
-
-        elif jones.ndim == 5:
-            # (n_time_src, n_freq, n_ant, 2, 2)
-            n_freq, n_ant = jones.shape[1:3]
-            jones_interp = np.zeros((n_time_tgt, n_freq, n_ant, 2, 2), dtype=np.complex128)
-
-            for f in range(n_freq):
-                for a in range(n_ant):
-                    for i in range(2):
-                        for j in range(2):
-                            # Real part
-                            f_real = interp1d(
-                                time_src,
-                                jones[:, f, a, i, j].real,
-                                kind=method,
-                                bounds_error=False,
-                                fill_value='extrapolate'
-                            )
-
-                            # Imaginary part
-                            f_imag = interp1d(
-                                time_src,
-                                jones[:, f, a, i, j].imag,
-                                kind=method,
-                                bounds_error=False,
-                                fill_value='extrapolate'
-                            )
-
-                            jones_interp[:, f, a, i, j] = f_real(time_tgt) + 1j * f_imag(time_tgt)
-
+    for a in range(n_ant):
+        # Check which solution times are valid for this antenna
+        if flags is not None:
+            valid = ~flags[:, a]
         else:
-            raise ValueError(f"Unexpected Jones shape for time interpolation: {jones.shape}")
+            valid = np.isfinite(jones[:, a, 0, 0].real)
 
-        return jones_interp
+        valid_idx = np.where(valid)[0]
 
-    else:
-        raise ValueError(f"Unknown interpolation method: {method}")
+        if len(valid_idx) == 0:
+            result[:, a] = np.nan + 0j
+            continue
+
+        if len(valid_idx) == 1:
+            result[:, a] = jones[valid_idx[0], a]
+            continue
+
+        valid_times = sol_times[valid_idx]
+
+        for i in range(2):
+            for j in range(2):
+                vals = jones[valid_idx, a, i, j]
+
+                if method == "amp_phase" and i == j:
+                    # Diagonal: interpolate amp and phase separately
+                    amp = np.abs(vals)
+                    phase = np.unwrap(np.angle(vals))
+                    amp_interp = np.interp(target_times, valid_times, amp)
+                    phase_interp = np.interp(target_times, valid_times, phase)
+                    result[:, a, i, j] = amp_interp * np.exp(1j * phase_interp)
+                elif method == "nearest" or i != j:
+                    # Off-diagonal or nearest: use nearest neighbor
+                    nearest_idx = np.searchsorted(valid_times, target_times, side="right") - 1
+                    nearest_idx = np.clip(nearest_idx, 0, len(valid_idx) - 1)
+                    # Check if next point is closer
+                    for t in range(n_target):
+                        ni = nearest_idx[t]
+                        if ni < len(valid_idx) - 1:
+                            d_left = abs(target_times[t] - valid_times[ni])
+                            d_right = abs(target_times[t] - valid_times[ni + 1])
+                            if d_right < d_left:
+                                nearest_idx[t] = ni + 1
+                    result[:, a, i, j] = vals[nearest_idx]
+                else:
+                    # Linear real/imag (fallback)
+                    re_interp = np.interp(target_times, valid_times, vals.real)
+                    im_interp = np.interp(target_times, valid_times, vals.imag)
+                    result[:, a, i, j] = re_interp + 1j * im_interp
+
+    return result
 
 
 def interpolate_jones_freq(
     jones: np.ndarray,
-    freq_src: np.ndarray,
-    freq_tgt: np.ndarray,
-    method: InterpMethod = 'linear'
+    sol_freq_centers: np.ndarray,
+    target_freq: np.ndarray,
+    method: str = "amp_phase",
 ) -> np.ndarray:
+    """Interpolate Jones matrices in frequency.
+
+    jones:            (n_sol_freq, n_ant, 2, 2) complex128
+    sol_freq_centers: (n_sol_freq,) float64  Hz
+    target_freq:      (n_target_freq,) float64  Hz
+
+    Returns: (n_target_freq, n_ant, 2, 2) complex128
     """
-    Interpolate Jones matrices in frequency dimension.
+    n_sol = jones.shape[0]
+    n_ant = jones.shape[1]
+    n_target = len(target_freq)
 
-    Parameters
-    ----------
-    jones : ndarray
-        Source Jones matrices (n_freq_src, n_ant, 2, 2)
-    freq_src : ndarray
-        Source frequency points (n_freq_src,)
-    freq_tgt : ndarray
-        Target frequency points (n_freq_tgt,)
-    method : str
-        Interpolation method: 'nearest', 'linear', 'cubic'
+    if n_sol == 1:
+        return np.broadcast_to(jones[0], (n_target, n_ant, 2, 2)).copy()
 
-    Returns
-    -------
-    jones_interp : ndarray
-        Interpolated Jones (n_freq_tgt, n_ant, 2, 2)
-    """
-    n_freq_src, n_ant = jones.shape[:2]
-    n_freq_tgt = len(freq_tgt)
+    result = np.empty((n_target, n_ant, 2, 2), dtype=np.complex128)
 
-    if n_freq_src == 1:
-        # Only one frequency, replicate
-        return np.tile(jones, (n_freq_tgt, 1, 1, 1))
+    for a in range(n_ant):
+        valid = np.isfinite(jones[:, a, 0, 0].real)
+        valid_idx = np.where(valid)[0]
 
-    if n_freq_src == n_freq_tgt and np.allclose(freq_src, freq_tgt):
-        # Frequencies match
-        return jones
+        if len(valid_idx) == 0:
+            result[:, a] = np.nan + 0j
+            continue
 
-    if method == 'nearest':
-        # Find nearest frequencies
-        jones_interp = np.zeros((n_freq_tgt, n_ant, 2, 2), dtype=np.complex128)
-        for f_idx, f in enumerate(freq_tgt):
-            src_idx = np.argmin(np.abs(freq_src - f))
-            jones_interp[f_idx] = jones[src_idx]
+        if len(valid_idx) == 1:
+            result[:, a] = jones[valid_idx[0], a]
+            continue
 
-        return jones_interp
+        valid_freqs = sol_freq_centers[valid_idx]
 
-    elif method in ('linear', 'cubic'):
-        # Interpolate real and imaginary parts separately
-        jones_interp = np.zeros((n_freq_tgt, n_ant, 2, 2), dtype=np.complex128)
-
-        for a in range(n_ant):
-            for i in range(2):
-                for j in range(2):
-                    # Real part
-                    f_real = interp1d(
-                        freq_src,
-                        jones[:, a, i, j].real,
-                        kind=method,
-                        bounds_error=False,
-                        fill_value='extrapolate'
+        for i in range(2):
+            for j in range(2):
+                vals = jones[valid_idx, a, i, j]
+                if method == "amp_phase" and i == j:
+                    amp = np.abs(vals)
+                    phase = np.unwrap(np.angle(vals))
+                    amp_interp = np.interp(target_freq, valid_freqs, amp)
+                    phase_interp = np.interp(target_freq, valid_freqs, phase)
+                    result[:, a, i, j] = amp_interp * np.exp(1j * phase_interp)
+                else:
+                    # Nearest for off-diagonal
+                    nearest_idx = np.argmin(
+                        np.abs(valid_freqs[:, None] - target_freq[None, :]), axis=0
                     )
+                    result[:, a, i, j] = vals[nearest_idx]
 
-                    # Imaginary part
-                    f_imag = interp1d(
-                        freq_src,
-                        jones[:, a, i, j].imag,
-                        kind=method,
-                        bounds_error=False,
-                        fill_value='extrapolate'
-                    )
-
-                    jones_interp[:, a, i, j] = f_real(freq_tgt) + 1j * f_imag(freq_tgt)
-
-        return jones_interp
-
-    else:
-        raise ValueError(f"Unknown interpolation method: {method}")
+    return result
 
 
-def interpolate_jones_to_chunk(
-    jones: np.ndarray,
-    time_src: np.ndarray,
-    freq_src: np.ndarray,
-    time_tgt: float,
-    freq_tgt: np.ndarray,
-    method_time: InterpMethod = 'linear',
-    method_freq: InterpMethod = 'linear'
+def interpolate_delay_to_freq(
+    delay: np.ndarray,
+    target_freq: np.ndarray,
 ) -> np.ndarray:
+    """Convert delay parameters directly to Jones at target frequencies.
+
+    No interpolation needed — exact computation from delay model.
+
+    delay:       (n_ant, 2) float64  — nanoseconds
+    target_freq: (n_freq,) float64   — Hz
+    Returns:     (n_ant, n_freq, 2, 2) complex128
     """
-    Interpolate Jones to match a specific data chunk.
-
-    This is used when applying pre-solved Jones with different solution
-    intervals to a chunk with its own time/frequency grid.
-
-    Parameters
-    ----------
-    jones : ndarray
-        Source Jones (n_time_src, n_freq_src, n_ant, 2, 2)
-    time_src : ndarray
-        Source time points (n_time_src,)
-    freq_src : ndarray
-        Source frequency points (n_freq_src,)
-    time_tgt : float
-        Target time (scalar, e.g., midpoint of chunk)
-    freq_tgt : ndarray
-        Target frequencies (n_freq_tgt,)
-    method_time : str
-        Time interpolation method
-    method_freq : str
-        Frequency interpolation method
-
-    Returns
-    -------
-    jones_interp : ndarray
-        Interpolated Jones (n_freq_tgt, n_ant, 2, 2)
-    """
-    # Interpolate in time first
-    jones_time = interpolate_jones_time(jones, time_src, time_tgt, method_time)
-
-    # Then interpolate in frequency
-    jones_interp = interpolate_jones_freq(jones_time, freq_src, freq_tgt, method_freq)
-
-    return jones_interp
-
-
-def get_chunk_time_center(time_range: Tuple[float, float]) -> float:
-    """
-    Get center time of a chunk.
-
-    Parameters
-    ----------
-    time_range : tuple
-        (t_start, t_end)
-
-    Returns
-    -------
-    t_center : float
-        Center time
-    """
-    return (time_range[0] + time_range[1]) / 2.0
-
-
-def create_source_time_grid(n_sol_time: int, time_range_total: Tuple[float, float]) -> np.ndarray:
-    """
-    Create time grid for source Jones solutions.
-
-    Returns midpoints of each solution interval.
-
-    Parameters
-    ----------
-    n_sol_time : int
-        Number of solution intervals
-    time_range_total : tuple
-        Total (t_min, t_max)
-
-    Returns
-    -------
-    time_grid : ndarray
-        Time points (n_sol_time,) at midpoints of intervals
-    """
-    t_min, t_max = time_range_total
-
-    if n_sol_time == 1:
-        return np.array([(t_min + t_max) / 2.0])
-
-    edges = np.linspace(t_min, t_max, n_sol_time + 1)
-    midpoints = (edges[:-1] + edges[1:]) / 2.0
-
-    return midpoints
-
-
-def create_source_freq_grid(n_sol_freq: int, freq_array: np.ndarray) -> np.ndarray:
-    """
-    Create frequency grid for source Jones solutions.
-
-    Returns center frequencies of each solution interval.
-
-    Parameters
-    ----------
-    n_sol_freq : int
-        Number of solution intervals in frequency
-    freq_array : ndarray
-        Full frequency array
-
-    Returns
-    -------
-    freq_grid : ndarray
-        Frequency points (n_sol_freq,) at centers of intervals
-    """
-    n_freq = len(freq_array)
-
-    if n_sol_freq == 1:
-        return np.array([np.median(freq_array)])
-
-    n_chan_per_chunk = n_freq // n_sol_freq
-    freq_centers = []
-
-    for i in range(n_sol_freq):
-        f_start = i * n_chan_per_chunk
-        f_end = f_start + n_chan_per_chunk if i < n_sol_freq - 1 else n_freq
-        freq_centers.append(np.median(freq_array[f_start:f_end]))
-
-    return np.array(freq_centers)
-
-
-def fill_flagged_from_valid(
-    jones: np.ndarray,
-    weights: np.ndarray,
-    time: np.ndarray = None,
-    freq: np.ndarray = None,
-    method: InterpMethod = 'linear'
-) -> np.ndarray:
-    """
-    Fill flagged (weight=0) Jones chunks by interpolating from valid (weight>0) neighbors.
-
-    Interpolates in both time and frequency dimensions to fill bad chunks.
-
-    Parameters
-    ----------
-    jones : ndarray
-        Jones matrices, shape (n_time, n_freq, n_ant, 2, 2)
-    weights : ndarray
-        Weights array, shape (n_time, n_freq), 1.0=valid, 0.0=flagged
-    time : ndarray, optional
-        Time coordinates (n_time,), for proper interpolation
-    freq : ndarray, optional
-        Frequency coordinates (n_freq,), for proper interpolation
-    method : str
-        Interpolation method: 'nearest', 'linear', 'cubic'
-
-    Returns
-    -------
-    jones_filled : ndarray
-        Jones with flagged chunks filled by interpolation
-    """
-    jones_filled = jones.copy()
-    n_time, n_freq, n_ant = jones.shape[:3]
-
-    # If all weights are 1, nothing to do
-    if np.all(weights > 0):
-        return jones_filled
-
-    # Time interpolation: for each freq, interpolate across time
-    if n_time > 1 and time is not None:
-        for f in range(n_freq):
-            # Find valid time points for this freq
-            valid_t = weights[:, f] > 0
-            if np.sum(valid_t) == 0:
-                # No valid points at this freq, skip
-                continue
-            if np.sum(valid_t) == n_time:
-                # All valid, skip
-                continue
-
-            valid_time = time[valid_t]
-
-            # Interpolate each antenna and matrix element
-            for a in range(n_ant):
-                for i in range(2):
-                    for j in range(2):
-                        valid_vals = jones[valid_t, f, a, i, j]
-
-                        # Interpolate real and imaginary separately
-                        if method == 'nearest':
-                            # Find nearest valid point for each invalid point
-                            for t in range(n_time):
-                                if weights[t, f] == 0:
-                                    idx = np.argmin(np.abs(valid_time - time[t]))
-                                    jones_filled[t, f, a, i, j] = valid_vals[idx]
-                        else:
-                            # Use scipy interp1d
-                            if len(valid_time) >= 2:
-                                f_real = interp1d(valid_time, valid_vals.real, kind=method,
-                                                bounds_error=False, fill_value='extrapolate')
-                                f_imag = interp1d(valid_time, valid_vals.imag, kind=method,
-                                                bounds_error=False, fill_value='extrapolate')
-
-                                # Fill invalid points
-                                for t in range(n_time):
-                                    if weights[t, f] == 0:
-                                        jones_filled[t, f, a, i, j] = f_real(time[t]) + 1j * f_imag(time[t])
-                            elif len(valid_time) == 1:
-                                # Only one valid point, use it for all invalid
-                                for t in range(n_time):
-                                    if weights[t, f] == 0:
-                                        jones_filled[t, f, a, i, j] = valid_vals[0]
-
-    # Frequency interpolation: for each time, interpolate across freq
-    if n_freq > 1 and freq is not None:
-        for t in range(n_time):
-            # Find valid freq points for this time
-            valid_f = weights[t, :] > 0
-            if np.sum(valid_f) == 0:
-                # No valid points at this time, skip
-                continue
-            if np.sum(valid_f) == n_freq:
-                # All valid, skip
-                continue
-
-            valid_freq = freq[valid_f]
-
-            # Interpolate each antenna and matrix element
-            for a in range(n_ant):
-                for i in range(2):
-                    for j in range(2):
-                        valid_vals = jones_filled[t, valid_f, a, i, j]
-
-                        # Interpolate real and imaginary separately
-                        if method == 'nearest':
-                            # Find nearest valid point for each invalid point
-                            for f in range(n_freq):
-                                if weights[t, f] == 0:
-                                    idx = np.argmin(np.abs(valid_freq - freq[f]))
-                                    jones_filled[t, f, a, i, j] = valid_vals[idx]
-                        else:
-                            # Use scipy interp1d
-                            if len(valid_freq) >= 2:
-                                f_real = interp1d(valid_freq, valid_vals.real, kind=method,
-                                                bounds_error=False, fill_value='extrapolate')
-                                f_imag = interp1d(valid_freq, valid_vals.imag, kind=method,
-                                                bounds_error=False, fill_value='extrapolate')
-
-                                # Fill invalid points
-                                for f in range(n_freq):
-                                    if weights[t, f] == 0:
-                                        jones_filled[t, f, a, i, j] = f_real(freq[f]) + 1j * f_imag(freq[f])
-                            elif len(valid_freq) == 1:
-                                # Only one valid point, use it for all invalid
-                                for f in range(n_freq):
-                                    if weights[t, f] == 0:
-                                        jones_filled[t, f, a, i, j] = valid_vals[0]
-
-    return jones_filled
-
-
-def log_interpolation_info(
-    jones_type: str,
-    source_shape: Tuple[int, int, int],
-    target_time: float,
-    target_freq_shape: int,
-    method_time: str,
-    method_freq: str
-):
-    """
-    Log interpolation operation details.
-
-    Parameters
-    ----------
-    jones_type : str
-        Type of Jones being interpolated
-    source_shape : tuple
-        (n_time_src, n_freq_src, n_ant)
-    target_time : float
-        Target time
-    target_freq_shape : int
-        Number of target frequencies
-    method_time : str
-        Time interpolation method
-    method_freq : str
-        Frequency interpolation method
-    """
-    n_time_src, n_freq_src, n_ant = source_shape
-
-    logger.debug(f"  Interpolating {jones_type}: "
-                f"({n_time_src}t, {n_freq_src}f, {n_ant}a) -> "
-                f"(1t, {target_freq_shape}f, {n_ant}a), "
-                f"methods: time={method_time}, freq={method_freq}")
-
-
-__all__ = [
-    'interpolate_jones_time',
-    'interpolate_jones_time_array',
-    'interpolate_jones_freq',
-    'interpolate_jones_to_chunk',
-    'fill_flagged_from_valid',
-    'get_chunk_time_center',
-    'create_source_time_grid',
-    'create_source_freq_grid',
-    'log_interpolation_info',
-    'InterpMethod',
-]
+    from ..jones import delay_to_jones
+    return delay_to_jones(delay, target_freq)

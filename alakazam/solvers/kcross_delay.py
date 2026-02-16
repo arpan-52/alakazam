@@ -1,315 +1,163 @@
 """
-Kcross Delay Solver - Crosshand frequency-dependent delays.
+ALAKAZAM Kcross (Cross-hand Delay) Solver.
 
-Jones Matrix:
-  Kcross affects XY and YX correlations
-  K_cross = [[1, exp(-2πi τ_xy ν)],
-             [exp(-2πi τ_yx ν), 1]]
+Solves for Kcross(ν) = diag(1, exp(-2πi τ_pq ν)) per antenna.
+Uses cross-hand correlations (XY,YX / RL,LR).
+Frequency axis kept — never averaged.
 
-Reference Constraint:
-  K_ref = I (identity)
-
-Parameters:
-  [τ_xy, τ_yx] per antenna in nanoseconds
-
-Averaging:
-  - Time: YES (average over solint)
-  - Freq: NO (need full freq for phase slope fitting)
-
-Chain Initial Guess:
-  For each frequency:
-    K_j(ν) = V_ref,j(ν) / M_ref,j(ν)  (since K_ref = I)
-    φ_xy(ν) = angle(K_j[0,1](ν))
-    φ_yx(ν) = angle(K_j[1,0](ν))
-  Fit: τ_xy = -d(φ_xy)/d(ν) / (2π)
-       τ_yx = -d(φ_yx)/d(ν) / (2π)
+Developed by Arpan Pal 2026, NRAO / NCRA
 """
 
 import numpy as np
-from scipy.optimize import least_squares
-from numba import njit
-from typing import Dict, Any
+from numba import njit, prange
+from typing import Dict, Optional
+from . import JonesSolver, build_antenna_graph, bfs_order
+from .k_delay import _unwrap_phase, _fit_delay_from_phase
+import logging
 
-from .base import JonesSolverBase, SolverMetadata
-from .utils import fit_phase_slope_weighted, find_ref_baselines
+logger = logging.getLogger("alakazam")
 
 
-class KcrossDelaySolver(JonesSolverBase):
-    """Kcross crosshand delay solver."""
+@njit(parallel=True, cache=True)
+def _kcross_residual(params, vis_obs, vis_model, ant1, ant2,
+                     n_ant, ref_ant, working_ants, freq):
+    """Residual for Kcross solver.
 
-    metadata = SolverMetadata(
-        jones_type='Kcross',
-        ref_constraint='identity',
-        can_avg_time=True,
-        can_avg_freq=False,  # Need full freq for delay fitting
-        description="Crosshand delays from XY/YX phase slope across frequency"
-    )
+    Packing: others=[τ_pq] per antenna (ns). Ref has τ=0.
+    Kcross = diag(1, exp(-2πi τ ν))
+    Cross-hand residuals only.
+    """
+    n_bl = vis_obs.shape[0]
+    n_freq = vis_obs.shape[1]
+    n_working = len(working_ants)
 
-    def chain_initial_guess(
-        self,
-        vis_obs: np.ndarray,
-        vis_model: np.ndarray,
-        antenna1: np.ndarray,
-        antenna2: np.ndarray,
-        freq: np.ndarray,
-        flags: np.ndarray,
-        ref_ant: int,
-        n_ant: int,
-        **kwargs
-    ) -> np.ndarray:
-        """
-        Chain solver for Kcross delays.
+    # Unpack delays
+    tau = np.zeros(n_ant, dtype=np.float64)
+    idx = 0
+    for w in range(n_working):
+        a = working_ants[w]
+        if a == ref_ant:
+            continue
+        tau[a] = params[idx]
+        idx += 1
 
-        For J_ref = I:
-          K_j(ν) = V_ref,j(ν) / M_ref,j(ν)
-          φ_xy(ν) = angle(K_j[0,1](ν))
-          φ_yx(ν) = angle(K_j[1,0](ν))
-          τ_xy = fit delay from φ_xy vs ν
-          τ_yx = fit delay from φ_yx vs ν
+    # Cross-hand residuals
+    residual = np.empty(n_bl * n_freq * 4, dtype=np.float64)
+    for bl in prange(n_bl):
+        a1 = ant1[bl]
+        a2 = ant2[bl]
+        for f in range(n_freq):
+            # J[a,0,0] = 1, J[a,1,1] = exp(-2πi τ ν)
+            J_a1_11 = np.exp(-2j * np.pi * tau[a1] * 1e-9 * freq[f])
+            J_a2_11 = np.exp(-2j * np.pi * tau[a2] * 1e-9 * freq[f])
 
-        Returns
-        -------
-        delays_init : ndarray (n_ant, 2)
-            Initial delays in nanoseconds [τ_xy, τ_yx]
-        """
-        n_freq = len(freq)
-        delays_init = np.zeros((n_ant, 2), dtype=np.float64)
+            # V_pq = 1 * M_pq * conj(J_j[1,1])
+            diff_pq = vis_obs[bl, f, 0, 1] - vis_model[bl, f, 0, 1] * np.conj(J_a2_11)
+            # V_qp = J_i[1,1] * M_qp * 1
+            diff_qp = vis_obs[bl, f, 1, 0] - J_a1_11 * vis_model[bl, f, 1, 0]
 
-        # Find baselines to reference
-        ref_baselines = find_ref_baselines(antenna1, antenna2, ref_ant)
+            r_idx = (bl * n_freq + f) * 4
+            residual[r_idx + 0] = diff_pq.real
+            residual[r_idx + 1] = diff_pq.imag
+            residual[r_idx + 2] = diff_qp.real
+            residual[r_idx + 3] = diff_qp.imag
 
-        if self.verbose:
-            print(f"[ALAKAZAM] Chain initial guess: {len(ref_baselines)} ref baselines")
+    return residual
 
-        # For each baseline to reference
-        for bl_idx, ant_j, flip in ref_baselines:
-            # For each crosshand correlation (XY, YX)
-            for corr_idx, (p1, p2) in enumerate([(0, 1), (1, 0)]):
-                V = vis_obs[bl_idx, :, p1, p2]
-                M = vis_model[bl_idx, :, p1, p2]
-                F = flags[bl_idx, :, p1, p2]
 
-                # Mask: unflagged + valid data
-                mask = ~F & (np.abs(M) > 1e-10) & np.isfinite(V) & np.isfinite(M)
+class KcrossDelaySolver(JonesSolver):
+    """Kcross (Cross-hand Delay) solver."""
 
-                if np.sum(mask) < 10:
-                    continue  # Not enough data
+    jones_type = "Kcross"
+    can_avg_freq = False
+    correlations = "cross"
+    ref_constraint = "identity"
 
-                # Chain solve: K_j = V / M (since K_ref = I)
-                if flip:
-                    # V = M × K_ref^H × K_j^H = M × K_j^H
-                    # K_j = (V / M)^*
-                    K_j = np.conj(V[mask] / M[mask])
+    def n_params(self, n_working, n_freq=1, phase_only=False):
+        return n_working - 1  # one delay per non-ref antenna
+
+    def chain_initial_guess(self, vis_avg, model_avg, ant1, ant2,
+                            n_ant, ref_ant, working_ants, freq=None,
+                            phase_only=False):
+        """Chain solver: phase slope fit on cross-hand correlations."""
+        if freq is None:
+            raise ValueError("Kcross solver requires freq array")
+
+        tau = np.zeros(n_ant, dtype=np.float64)
+        graph = build_antenna_graph(ant1, ant2, n_ant)
+        order = bfs_order(graph, ref_ant, working_ants)
+
+        for (ant, parent, bl_idx, is_parent_ant1) in order:
+            V = vis_avg[bl_idx]   # (n_freq, 2, 2)
+            M = model_avg[bl_idx]
+
+            # Use QP correlation: V_qp = exp(-2πiτ_ant ν) * M_qp * 1
+            ratio = np.zeros(len(freq), dtype=np.complex128)
+            for f in range(len(freq)):
+                m_val = M[f, 1, 0]  # M_qp
+                if np.abs(m_val) > 1e-20:
+                    ratio[f] = V[f, 1, 0] / m_val
                 else:
-                    # V = K_j × M × K_ref^H = K_j × M
-                    # K_j = V / M
-                    K_j = V[mask] / M[mask]
+                    m_val2 = M[f, 0, 1]  # M_pq
+                    if np.abs(m_val2) > 1e-20:
+                        ratio[f] = np.conj(V[f, 0, 1] / m_val2)
+                    else:
+                        ratio[f] = 1.0
 
-                # Extract phase
-                phase = np.angle(K_j)
-                phase_unwrap = np.unwrap(phase)
-                freq_valid = freq[mask]
+            # Remove parent delay contribution
+            parent_tau = tau[parent] * 1e-9
+            for f in range(len(freq)):
+                if is_parent_ant1:
+                    ratio[f] *= np.exp(2j * np.pi * parent_tau * freq[f])
+                else:
+                    ratio[f] *= np.exp(2j * np.pi * parent_tau * freq[f])
 
-                # Fit delay from phase slope
-                delay_ns = fit_phase_slope_weighted(phase_unwrap, freq_valid)
+            phase = np.angle(ratio)
+            phase_uw = _unwrap_phase(phase)
+            tau_fit = _fit_delay_from_phase(phase_uw, freq)
 
-                delays_init[ant_j, corr_idx] = delay_ns
+            tau[ant] = tau_fit
 
-        return delays_init
+        return self._pack_delay(tau, ref_ant, working_ants)
 
-    def residual(
-        self,
-        params: np.ndarray,
-        vis_obs: np.ndarray,
-        vis_model: np.ndarray,
-        antenna1: np.ndarray,
-        antenna2: np.ndarray,
-        freq: np.ndarray,
-        flags: np.ndarray,
-        n_ant: int,
-        ref_ant: int,
-        **kwargs
-    ) -> np.ndarray:
-        """
-        Compute residuals for Kcross delay optimization.
-
-        Apply Kcross delays to model and compute complex residuals for XY/YX.
-        """
-        # Unpack delays
-        delays = self.unpack_params(params, n_ant, ref_ant)
-
-        # Compute residuals
-        residuals = _kcross_delay_residual(
-            delays, vis_obs, vis_model, antenna1, antenna2, freq, flags
-        )
-
-        return residuals
-
-    def pack_params(
-        self,
-        jones: np.ndarray,
-        ref_ant: int,
-        **kwargs
-    ) -> np.ndarray:
-        """
-        Pack delays to parameter array.
-
-        jones : ndarray (n_ant, 2)
-            Delays [τ_xy, τ_yx] in nanoseconds
-
-        Returns params excluding reference antenna.
-        """
-        n_ant = jones.shape[0]
+    def _pack_delay(self, tau, ref_ant, working_ants):
         params = []
-
-        for ant in range(n_ant):
-            if ant != ref_ant:
-                params.extend([jones[ant, 0], jones[ant, 1]])
-
+        for a in working_ants:
+            if a == ref_ant:
+                continue
+            params.append(tau[a])
         return np.array(params, dtype=np.float64)
 
-    def unpack_params(
-        self,
-        params: np.ndarray,
-        n_ant: int,
-        ref_ant: int,
-        **kwargs
-    ) -> np.ndarray:
-        """
-        Unpack parameters to delays.
-
-        Returns delays (n_ant, 2) with ref=0.
-        """
-        delays = np.zeros((n_ant, 2), dtype=np.float64)
+    def _unpack_delay(self, params, n_ant, ref_ant, working_ants):
+        tau = np.full(n_ant, np.nan, dtype=np.float64)
+        tau[ref_ant] = 0.0
         idx = 0
+        for a in working_ants:
+            if a == ref_ant:
+                continue
+            tau[a] = params[idx]
+            idx += 1
+        return tau
 
-        for ant in range(n_ant):
-            if ant != ref_ant:
-                delays[ant, 0] = params[idx]
-                delays[ant, 1] = params[idx + 1]
-                idx += 2
+    def pack_params(self, jones, n_ant, ref_ant, working_ants, phase_only=False):
+        raise NotImplementedError("Use _pack_delay for Kcross solver")
 
-        return delays
+    def unpack_params(self, params, n_ant, ref_ant, working_ants,
+                      freq=None, phase_only=False):
+        tau = self._unpack_delay(params, n_ant, ref_ant, working_ants)
+        if freq is None:
+            raise ValueError("Kcross solver requires freq for unpack_params")
+        from ..jones import crossdelay_to_jones
+        return crossdelay_to_jones(tau, freq)
 
-    def print_solution(
-        self,
-        jones: np.ndarray,
-        working_ants: np.ndarray,
-        ref_ant: int,
-        convergence_info: Dict[str, Any]
-    ):
-        """Print Kcross delay solution."""
-        if not self.verbose:
-            return
+    def residual_func(self, params, vis_avg, model_avg, ant1, ant2,
+                      n_ant, ref_ant, working_ants, freq=None,
+                      phase_only=False):
+        if freq is None:
+            raise ValueError("Kcross solver requires freq")
+        return _kcross_residual(params, vis_avg, model_avg, ant1, ant2,
+                                n_ant, ref_ant, working_ants, freq)
 
-        delays = jones  # (n_working, 2)
-
-        print(f"[ALAKAZAM] Cost: {convergence_info['cost_init']:.4e} -> {convergence_info['cost_final']:.4e}")
-        print(f"[ALAKAZAM] Final crosshand delays (ns):")
-
-        for i in range(len(working_ants)):
-            ant_full = working_ants[i]
-            status = "[ref]" if ant_full == ref_ant else ""
-            print(f"        Ant {ant_full:2d}: XY={delays[i, 0]:+8.3f}, YX={delays[i, 1]:+8.3f}  {status}")
-
-
-@njit(cache=True)
-def _kcross_delay_residual(
-    delays: np.ndarray,
-    vis_obs: np.ndarray,
-    vis_model: np.ndarray,
-    antenna1: np.ndarray,
-    antenna2: np.ndarray,
-    freq: np.ndarray,
-    flags: np.ndarray
-) -> np.ndarray:
-    """
-    Compute residuals for Kcross delay solver.
-
-    Numba-compiled for speed.
-
-    Parameters
-    ----------
-    delays : ndarray (n_ant, 2)
-        Delays [τ_xy, τ_yx] in nanoseconds
-    vis_obs, vis_model : ndarray (n_bl, n_freq, 2, 2)
-        Visibilities
-    antenna1, antenna2 : ndarray (n_bl,)
-        Antenna indices
-    freq : ndarray (n_freq,)
-        Frequencies in Hz
-    flags : ndarray (n_bl, n_freq, 2, 2)
-        Flags (True = flagged)
-
-    Returns
-    -------
-    residuals : ndarray
-        Flattened real residuals for unflagged XY/YX data
-    """
-    n_bl = len(antenna1)
-    n_freq = len(freq)
-
-    # Count unflagged crosshand data points
-    n_unflagged = 0
-    for bl in range(n_bl):
-        for ch in range(n_freq):
-            if not flags[bl, ch, 0, 1]:  # XY
-                n_unflagged += 1
-            if not flags[bl, ch, 1, 0]:  # YX
-                n_unflagged += 1
-
-    # Allocate residual array (2 values per unflagged correlation: real + imag)
-    residuals = np.zeros(n_unflagged * 2, dtype=np.float64)
-    res_idx = 0
-
-    # For each baseline and frequency
-    for bl in range(n_bl):
-        a1 = antenna1[bl]
-        a2 = antenna2[bl]
-
-        for ch in range(n_freq):
-            f = freq[ch]
-
-            # Compute Jones matrices for crosshand
-            # Kcross = [[1, exp(-2πi τ_xy ν)],
-            #           [exp(-2πi τ_yx ν), 1]]
-
-            phase_xy1 = -2.0 * np.pi * delays[a1, 0] * f * 1e-9
-            phase_yx1 = -2.0 * np.pi * delays[a1, 1] * f * 1e-9
-            phase_xy2 = -2.0 * np.pi * delays[a2, 0] * f * 1e-9
-            phase_yx2 = -2.0 * np.pi * delays[a2, 1] * f * 1e-9
-
-            K1_xy = np.exp(1j * phase_xy1)
-            K1_yx = np.exp(1j * phase_yx1)
-            K2_xy = np.exp(1j * phase_xy2)
-            K2_yx = np.exp(1j * phase_yx2)
-
-            # Apply Kcross to model: V' = K1 × M × K2^H
-            # For XY correlation: V'_xy = K1_xy × M_xy + K1_xy × M_yy × K2_yx^*
-            # Simplified for diagonal M (assuming model is parallel-hand only):
-            # V'_xy ≈ K1_xy × M_xy × K2_xy^*
-
-            # XY correlation
-            if not flags[bl, ch, 0, 1]:
-                M_xy = vis_model[bl, ch, 0, 1]
-                V_predicted = K1_xy * M_xy * np.conj(K2_xy)
-                V_observed = vis_obs[bl, ch, 0, 1]
-
-                residuals[res_idx] = (V_observed - V_predicted).real
-                residuals[res_idx + 1] = (V_observed - V_predicted).imag
-                res_idx += 2
-
-            # YX correlation
-            if not flags[bl, ch, 1, 0]:
-                M_yx = vis_model[bl, ch, 1, 0]
-                V_predicted = K1_yx * M_yx * np.conj(K2_yx)
-                V_observed = vis_obs[bl, ch, 1, 0]
-
-                residuals[res_idx] = (V_observed - V_predicted).real
-                residuals[res_idx + 1] = (V_observed - V_predicted).imag
-                res_idx += 2
-
-    return residuals
-
-
-__all__ = ['KcrossDelaySolver']
+    def get_native_params(self, params, n_ant, ref_ant, working_ants, freq=None):
+        tau = self._unpack_delay(params, n_ant, ref_ant, working_ants)
+        return {"cross_delay": tau}

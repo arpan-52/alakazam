@@ -1,286 +1,163 @@
 """
-Xf Crosshand Phase Solver - Frequency-independent crosshand phase.
+ALAKAZAM Xf (Cross-hand Phase) Solver.
 
-Jones Matrix:
-  Xf = [[1, exp(i φ_xy)],
-        [exp(i φ_yx), 1]]
+Solves for Xf = diag(1, exp(iφ_pq)) per antenna.
+CORRECTED standard diagonal form (not the old off-diagonal form).
+Uses cross-hand correlations (XY,YX / RL,LR).
 
-Reference Constraint:
-  Xf_ref = I (identity, φ_ref = 0)
-
-Parameters:
-  [φ_xy, φ_yx] per antenna in radians
-
-Averaging:
-  - Time: YES (average over solint)
-  - Freq: YES (frequency-independent phase)
-
-Chain Initial Guess:
-  Xf_j = V_ref,j / M_ref,j  (averaged over freq)
-  φ_xy = angle(Xf_j[0,1])
-  φ_yx = angle(Xf_j[1,0])
+Developed by Arpan Pal 2026, NRAO / NCRA
 """
 
 import numpy as np
-from scipy.optimize import least_squares
-from numba import njit
-from typing import Dict, Any
+from numba import njit, prange
+from typing import Dict, Optional
+from . import JonesSolver, build_antenna_graph, bfs_order
+import logging
 
-from .base import JonesSolverBase, SolverMetadata
-from .utils import find_ref_baselines
+logger = logging.getLogger("alakazam")
 
 
-class XfCrossphaseSolver(JonesSolverBase):
-    """Xf crosshand phase solver."""
+@njit(parallel=True, cache=True)
+def _xf_residual(params, vis_obs, vis_model, ant1, ant2,
+                 n_ant, ref_ant, working_ants):
+    """Residual for Xf cross-hand phase solver.
 
-    metadata = SolverMetadata(
-        jones_type='Xf',
-        ref_constraint='phase_zero',
-        can_avg_time=True,
-        can_avg_freq=True,  # Frequency-independent
-        description="Crosshand phase from XY/YX correlations"
-    )
+    Packing: others=[φ_pq] per antenna. Ref has φ=0 (no params).
+    Xf = diag(1, exp(iφ))
+    Cross-hand residuals only.
+    """
+    n_bl = vis_obs.shape[0]
+    n_working = len(working_ants)
 
-    def chain_initial_guess(
-        self,
-        vis_obs: np.ndarray,
-        vis_model: np.ndarray,
-        antenna1: np.ndarray,
-        antenna2: np.ndarray,
-        freq: np.ndarray,
-        flags: np.ndarray,
-        ref_ant: int,
-        n_ant: int,
-        **kwargs
-    ) -> np.ndarray:
-        """
-        Chain solver for Xf crosshand phase.
+    # Build Jones (diagonal): J[a,0,0]=1, J[a,1,1]=exp(iφ)
+    J_00 = np.ones(n_ant, dtype=np.complex128)
+    J_11 = np.ones(n_ant, dtype=np.complex128)
+    J_11[ref_ant] = 1.0 + 0j
 
-        For Xf_ref = I:
-          Xf_j = V_ref,j / M_ref,j
-          φ_xy = angle(Xf_j[0,1])
-          φ_yx = angle(Xf_j[1,0])
+    idx = 0
+    for w in range(n_working):
+        a = working_ants[w]
+        if a == ref_ant:
+            continue
+        J_11[a] = np.exp(1j * params[idx])
+        idx += 1
 
-        Returns
-        -------
-        phases_init : ndarray (n_ant, 2)
-            Initial phases in radians [φ_xy, φ_yx]
-        """
-        phases_init = np.zeros((n_ant, 2), dtype=np.float64)
+    # Cross-hand residuals: pq and qp
+    # V_pq = J_i[0,0] * M_pq * conj(J_j[1,1])
+    # V_qp = J_i[1,1] * M_qp * conj(J_j[0,0])
+    residual = np.empty(n_bl * 4, dtype=np.float64)
+    for bl in prange(n_bl):
+        a1 = ant1[bl]
+        a2 = ant2[bl]
+        diff_pq = vis_obs[bl, 0, 1] - J_00[a1] * vis_model[bl, 0, 1] * np.conj(J_11[a2])
+        diff_qp = vis_obs[bl, 1, 0] - J_11[a1] * vis_model[bl, 1, 0] * np.conj(J_00[a2])
+        r_idx = bl * 4
+        residual[r_idx + 0] = diff_pq.real
+        residual[r_idx + 1] = diff_pq.imag
+        residual[r_idx + 2] = diff_qp.real
+        residual[r_idx + 3] = diff_qp.imag
 
-        # Find baselines to reference
-        ref_baselines = find_ref_baselines(antenna1, antenna2, ref_ant)
+    return residual
 
-        if self.verbose:
-            print(f"[ALAKAZAM] Chain initial guess: {len(ref_baselines)} ref baselines")
 
-        # For each baseline to reference
-        for bl_idx, ant_j, flip in ref_baselines:
-            # For each crosshand correlation (XY, YX)
-            for corr_idx, (p1, p2) in enumerate([(0, 1), (1, 0)]):
-                V = vis_obs[bl_idx, p1, p2]
-                M = vis_model[bl_idx, p1, p2]
-                F = flags[bl_idx, p1, p2]
+class XfCrossPhaseSolver(JonesSolver):
+    """Xf (Cross-hand Phase) solver."""
 
-                # Skip if flagged or invalid
-                if F or np.abs(M) < 1e-10 or not np.isfinite(V) or not np.isfinite(M):
-                    continue
+    jones_type = "Xf"
+    can_avg_freq = True
+    correlations = "cross"
+    ref_constraint = "identity"
 
-                # Chain solve: Xf_j = V / M (since Xf_ref = I)
-                if flip:
-                    # V = M × Xf_ref^H × Xf_j^H = M × Xf_j^H
-                    # Xf_j = (V / M)^*
-                    Xf_j = np.conj(V / M)
+    def n_params(self, n_working, n_freq=1, phase_only=False):
+        return n_working - 1  # one phase per non-ref antenna
+
+    def chain_initial_guess(self, vis_avg, model_avg, ant1, ant2,
+                            n_ant, ref_ant, working_ants, freq=None,
+                            phase_only=False):
+        """Chain solver: extract cross-hand phase from ref baselines."""
+        phi = np.zeros(n_ant, dtype=np.float64)
+        graph = build_antenna_graph(ant1, ant2, n_ant)
+        order = bfs_order(graph, ref_ant, working_ants)
+
+        for (ant, parent, bl_idx, is_parent_ant1) in order:
+            V = vis_avg[bl_idx]
+            M = model_avg[bl_idx]
+
+            # Use XY correlation: V_pq = J_i[0,0] * M_pq * conj(J_j[1,1])
+            # For baseline to ref (φ_ref=0): V_pq = M_pq * conj(exp(iφ_ant))
+            # → φ_ant = -angle(V_pq / M_pq)
+            M_pq = M[0, 1]
+            if np.abs(M_pq) > 1e-20:
+                ratio = V[0, 1] / M_pq
+                if is_parent_ant1:
+                    # parent is ant1: V_pq = 1 * M_pq * conj(exp(iφ_ant))
+                    # ratio = exp(-iφ_ant) → φ_ant = -angle(ratio)
+                    phi[ant] = -np.angle(ratio) + phi[parent] * 0  # parent's effect already in data
+                    # More precisely with parent known:
+                    # Correct for parent: ratio' = ratio / (J_parent_00 * conj(J_parent_11))
+                    # But J_00=1 for Xf, so: ratio' = ratio * exp(iφ_parent)
+                    phi[ant] = -np.angle(ratio * np.exp(1j * phi[parent]))
                 else:
-                    # V = Xf_j × M × Xf_ref^H = Xf_j × M
-                    # Xf_j = V / M
-                    Xf_j = V / M
+                    # ant is ant1: V_pq = 1 * M_pq * conj(exp(iφ_parent))
+                    # This gives φ_parent info — use qp instead
+                    M_qp = M[1, 0]
+                    if np.abs(M_qp) > 1e-20:
+                        ratio_qp = V[1, 0] / M_qp
+                        # V_qp = exp(iφ_ant) * M_qp * 1
+                        phi[ant] = np.angle(ratio_qp / np.exp(1j * phi[parent]))
+                    else:
+                        phi[ant] = 0.0
+            else:
+                # Try qp
+                M_qp = M[1, 0]
+                if np.abs(M_qp) > 1e-20:
+                    ratio_qp = V[1, 0] / M_qp
+                    if not is_parent_ant1:
+                        phi[ant] = np.angle(ratio_qp * np.exp(-1j * phi[parent]))
+                    else:
+                        phi[ant] = np.angle(ratio_qp * np.exp(-1j * phi[parent]))
+                else:
+                    phi[ant] = 0.0
 
-                # Extract phase
-                phase = np.angle(Xf_j)
-                phases_init[ant_j, corr_idx] = phase
+        return self._pack_phase(phi, ref_ant, working_ants)
 
-        return phases_init
-
-    def residual(
-        self,
-        params: np.ndarray,
-        vis_obs: np.ndarray,
-        vis_model: np.ndarray,
-        antenna1: np.ndarray,
-        antenna2: np.ndarray,
-        freq: np.ndarray,
-        flags: np.ndarray,
-        n_ant: int,
-        ref_ant: int,
-        **kwargs
-    ) -> np.ndarray:
-        """
-        Compute residuals for Xf crossphase optimization.
-
-        Apply Xf phases to model and compute complex residuals for XY/YX.
-        """
-        # Unpack phases
-        phases = self.unpack_params(params, n_ant, ref_ant)
-
-        # Compute residuals
-        residuals = _xf_crossphase_residual(
-            phases, vis_obs, vis_model, antenna1, antenna2, flags
-        )
-
-        return residuals
-
-    def pack_params(
-        self,
-        jones: np.ndarray,
-        ref_ant: int,
-        **kwargs
-    ) -> np.ndarray:
-        """
-        Pack phases to parameter array.
-
-        jones : ndarray (n_ant, 2)
-            Phases [φ_xy, φ_yx] in radians
-
-        Returns params excluding reference antenna.
-        """
-        n_ant = jones.shape[0]
+    def _pack_phase(self, phi, ref_ant, working_ants):
         params = []
-
-        for ant in range(n_ant):
-            if ant != ref_ant:
-                params.extend([jones[ant, 0], jones[ant, 1]])
-
+        for a in working_ants:
+            if a == ref_ant:
+                continue
+            params.append(phi[a])
         return np.array(params, dtype=np.float64)
 
-    def unpack_params(
-        self,
-        params: np.ndarray,
-        n_ant: int,
-        ref_ant: int,
-        **kwargs
-    ) -> np.ndarray:
-        """
-        Unpack parameters to phases.
-
-        Returns phases (n_ant, 2) with ref=0.
-        """
-        phases = np.zeros((n_ant, 2), dtype=np.float64)
+    def _unpack_phase(self, params, n_ant, ref_ant, working_ants):
+        phi = np.full(n_ant, np.nan, dtype=np.float64)
+        phi[ref_ant] = 0.0
         idx = 0
+        for a in working_ants:
+            if a == ref_ant:
+                continue
+            phi[a] = params[idx]
+            idx += 1
+        return phi
 
-        for ant in range(n_ant):
-            if ant != ref_ant:
-                phases[ant, 0] = params[idx]
-                phases[ant, 1] = params[idx + 1]
-                idx += 2
+    def pack_params(self, jones, n_ant, ref_ant, working_ants, phase_only=False):
+        phi = np.zeros(n_ant, dtype=np.float64)
+        for a in working_ants:
+            phi[a] = np.angle(jones[a, 1, 1])
+        return self._pack_phase(phi, ref_ant, working_ants)
 
-        return phases
+    def unpack_params(self, params, n_ant, ref_ant, working_ants,
+                      freq=None, phase_only=False):
+        phi = self._unpack_phase(params, n_ant, ref_ant, working_ants)
+        from ..jones import crossphase_to_jones
+        return crossphase_to_jones(phi, n_ant)
 
-    def print_solution(
-        self,
-        jones: np.ndarray,
-        working_ants: np.ndarray,
-        ref_ant: int,
-        convergence_info: Dict[str, Any]
-    ):
-        """Print Xf crossphase solution."""
-        if not self.verbose:
-            return
+    def residual_func(self, params, vis_avg, model_avg, ant1, ant2,
+                      n_ant, ref_ant, working_ants, freq=None,
+                      phase_only=False):
+        return _xf_residual(params, vis_avg, model_avg, ant1, ant2,
+                            n_ant, ref_ant, working_ants)
 
-        phases = jones  # (n_working, 2)
-        phases_deg = np.rad2deg(phases)
-
-        print(f"[ALAKAZAM] Cost: {convergence_info['cost_init']:.4e} -> {convergence_info['cost_final']:.4e}")
-        print(f"[ALAKAZAM] Final crosshand phases (deg):")
-
-        for i in range(len(working_ants)):
-            ant_full = working_ants[i]
-            status = "[ref]" if ant_full == ref_ant else ""
-            print(f"        Ant {ant_full:2d}: XY={phases_deg[i, 0]:+8.2f}, YX={phases_deg[i, 1]:+8.2f}  {status}")
-
-
-@njit(cache=True)
-def _xf_crossphase_residual(
-    phases: np.ndarray,
-    vis_obs: np.ndarray,
-    vis_model: np.ndarray,
-    antenna1: np.ndarray,
-    antenna2: np.ndarray,
-    flags: np.ndarray
-) -> np.ndarray:
-    """
-    Compute residuals for Xf crossphase solver.
-
-    Numba-compiled for speed.
-
-    Parameters
-    ----------
-    phases : ndarray (n_ant, 2)
-        Phases [φ_xy, φ_yx] in radians
-    vis_obs, vis_model : ndarray (n_bl, 2, 2)
-        Visibilities (time+freq averaged)
-    antenna1, antenna2 : ndarray (n_bl,)
-        Antenna indices
-    flags : ndarray (n_bl, 2, 2)
-        Flags (True = flagged)
-
-    Returns
-    -------
-    residuals : ndarray
-        Flattened real residuals for unflagged XY/YX data
-    """
-    n_bl = len(antenna1)
-
-    # Count unflagged crosshand data points
-    n_unflagged = 0
-    for bl in range(n_bl):
-        if not flags[bl, 0, 1]:  # XY
-            n_unflagged += 1
-        if not flags[bl, 1, 0]:  # YX
-            n_unflagged += 1
-
-    # Allocate residual array (2 values per unflagged correlation: real + imag)
-    residuals = np.zeros(n_unflagged * 2, dtype=np.float64)
-    res_idx = 0
-
-    # For each baseline
-    for bl in range(n_bl):
-        a1 = antenna1[bl]
-        a2 = antenna2[bl]
-
-        # Compute Jones matrices for crosshand
-        # Xf = [[1, exp(i φ_xy)],
-        #       [exp(i φ_yx), 1]]
-
-        Xf1_xy = np.exp(1j * phases[a1, 0])
-        Xf1_yx = np.exp(1j * phases[a1, 1])
-        Xf2_xy = np.exp(1j * phases[a2, 0])
-        Xf2_yx = np.exp(1j * phases[a2, 1])
-
-        # Apply Xf to model: V' = Xf1 × M × Xf2^H
-        # For XY correlation: V'_xy = Xf1_xy × M_xy × Xf2_xy^*
-
-        # XY correlation
-        if not flags[bl, 0, 1]:
-            M_xy = vis_model[bl, 0, 1]
-            V_predicted = Xf1_xy * M_xy * np.conj(Xf2_xy)
-            V_observed = vis_obs[bl, 0, 1]
-
-            residuals[res_idx] = (V_observed - V_predicted).real
-            residuals[res_idx + 1] = (V_observed - V_predicted).imag
-            res_idx += 2
-
-        # YX correlation
-        if not flags[bl, 1, 0]:
-            M_yx = vis_model[bl, 1, 0]
-            V_predicted = Xf1_yx * M_yx * np.conj(Xf2_yx)
-            V_observed = vis_obs[bl, 1, 0]
-
-            residuals[res_idx] = (V_observed - V_predicted).real
-            residuals[res_idx + 1] = (V_observed - V_predicted).imag
-            res_idx += 2
-
-    return residuals
-
-
-__all__ = ['XfCrossphaseSolver']
+    def get_native_params(self, params, n_ant, ref_ant, working_ants, freq=None):
+        phi = self._unpack_phase(params, n_ant, ref_ant, working_ants)
+        return {"cross_phase": phi}

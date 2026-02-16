@@ -1,624 +1,259 @@
 # ALAKAZAM
 
-**A Radio Interferometry Calibrator**
-Developed by Arpan Pal, 2026
+**A Radio Interferometric Calibration Suite for Arrays**
 
-ALAKAZAM is a direction-independent calibration solver for radio interferometry data using Jones matrix formalism.
+*Developed by Arpan Pal 2026, NRAO / NCRA*
 
-## Mathematical Formalism
+---
 
-### Visibility Equation
+## Overview
 
-The measured visibility for baseline between antennas *i* and *j* is modeled as:
-
-```
-V_ij = J_i V_ij^true J_j^H
-```
-
-where:
-- `V_ij` is the observed 2×2 visibility matrix
-- `J_i`, `J_j` are 2×2 Jones matrices for antennas *i*, *j*
-- `V_ij^true` is the true sky visibility
-- `^H` denotes conjugate transpose
-
-### Jones Matrix Decomposition
-
-The total Jones matrix is decomposed as a product:
+ALAKAZAM is a fast, memory-safe radio interferometry calibration package. It solves for antenna-based Jones matrices using the Radio Interferometer Measurement Equation (RIME):
 
 ```
-J = K · B · G · D · Xf · Kcross
+V_obs = J_i · V_model · J_j^H
 ```
 
-Each term represents a specific instrumental effect. ALAKAZAM solves these terms sequentially.
-
-### Calibration Objective
-
-For each Jones type, solve the nonlinear least-squares problem:
-
-```
-min_J  Σ_ij |w_ij (V_ij^obs - J_i V_ij^model J_j^H)|²
-```
-
-where `w_ij` are visibility weights and the sum is over all baselines.
-
-## Supported Jones Terms
-
-| Symbol | Name | Parameters | Averaging | Reference Constraint |
-|--------|------|------------|-----------|---------------------|
-| **K** | Delay | Delay τ per antenna, per pol | Time-averaged | τ_ref = 0 |
-| **B** | Bandpass | Complex gain per antenna, per freq, per pol | Time-averaged | ∠g_ref = 0 |
-| **G** | Gain | Complex gain per antenna, per pol | Freq-averaged | ∠g_ref = 0 |
-| **D** | Leakage | Off-diagonal terms d_xy, d_yx | Time & freq averaged | d_ref = 0 |
-| **Xf** | Crosshand phase | Phase ϕ between X-Y correlations | Time & freq averaged | None |
-| **Kcross** | Crosshand delay | Delay τ_xy between X-Y | Time-averaged | τ_xy,ref = 0 |
-
-### Delay (K)
-
-Parameterization:
-```
-K_i = [ e^(2πiντ_X)      0          ]
-      [      0       e^(2πiντ_Y)    ]
-```
-
-where ν is frequency and τ_X, τ_Y are delays for each polarization.
-
-**Solver**: Frequency-domain solver using FFT. Finds delays by peak-finding in delay spectrum.
-
-### Bandpass (B)
-
-Parameterization:
-```
-B_i(ν) = [ g_X(ν)    0      ]
-         [   0     g_Y(ν)   ]
-```
-
-where g_X(ν), g_Y(ν) are complex frequency-dependent gains.
-
-**Solver**: Nonlinear least-squares per frequency channel, time-averaged across observation.
-
-### Gain (G)
-
-Parameterization:
-```
-G_i = [ g_X    0   ]
-      [  0    g_Y  ]
-```
-
-where g_X, g_Y are complex scalar gains (frequency-averaged).
-
-**Solver**: Nonlinear least-squares, frequency-averaged across band.
-
-### Leakage (D)
-
-Parameterization:
-```
-D_i = [   1      d_xy ]
-      [ d_yx      1   ]
-```
-
-where d_xy, d_yx are small complex leakage terms (|d| ≪ 1).
-
-**Solver**: Nonlinear least-squares using all 4 correlation products.
-
-### Crosshand Phase (Xf)
-
-Parameterization:
-```
-Xf_i = [ 1         0        ]
-       [ 0    e^(iϕ_XY)    ]
-```
-
-where ϕ_XY is a global phase offset between X and Y.
-
-**Solver**: Nonlinear least-squares using XY and YX correlations. No reference antenna constraint.
-
-### Crosshand Delay (Kcross)
-
-Parameterization:
-```
-Kcross_i = [ 1              0           ]
-           [ 0    e^(2πiντ_XY)          ]
-```
-
-where τ_XY is the delay between X and Y polarizations.
-
-**Solver**: Frequency-domain solver using cross-correlation products.
-
-## Solution Intervals (solint)
-
-Solution intervals control time and frequency resolution of calibration solutions.
-
-### Time Intervals
-
-Specify as:
-- `"10s"` - 10 seconds
-- `"2min"` - 2 minutes
-- `"inf"` - entire observation (single solution)
-
-### Frequency Intervals
-
-Specify as:
-- `"2MHz"` - 2 MHz chunks
-- `"128chan"` - 128 channel chunks
-- `"full"` - entire band (single solution)
-
-### Multi-dimensional Solutions
-
-When both time and frequency intervals are specified, ALAKAZAM produces multi-dimensional Jones matrices with shape `(n_time, n_freq, n_ant, 2, 2)`.
-
-Example:
-```yaml
-solint:
-  time_interval: 2min
-  freq_interval: 2MHz
-```
-
-This produces solutions on a 2D grid: one per 2-minute time block and per 2-MHz frequency chunk.
-
-## Configuration Reference
-
-### Basic Configuration
-
-```yaml
-ms_files: "path/to/data.ms"
-output_h5: "calibration.h5"
-
-field: "0"              # Field selection (optional)
-spw: "0"                # SPW selection (optional)
-
-jones: [K, B, G]        # Jones terms to solve, in order
-
-solint:
-  time_interval: inf    # or "10s", "2min", etc.
-  freq_interval: full   # or "2MHz", "128chan", etc.
-
-model_col: "MODEL_DATA"
-data_col: "DATA"
-
-ref_ant: 0              # Reference antenna index
-
-max_iter: 200           # Maximum iterations for nonlinear solver
-tol: 1e-8               # Convergence tolerance
-
-rfi:
-  enable: true
-  threshold: 5.0        # MAD threshold for flagging
-  per_baseline: true    # Flag per baseline (recommended)
-```
-
-### Multi-Jones Configuration with Different solint
-
-Each Jones term can have its own solution interval:
-
-```yaml
-jones: [K, B, G]
-
-solint:
-  time_interval: [inf, inf, 2min]
-  freq_interval: [full, 2MHz, full]
-```
-
-This solves:
-- **K**: Single solution (time=inf, freq=full)
-- **B**: Per 2MHz chunk (time=inf, freq=2MHz)
-- **G**: Per 2-minute (time=2min, freq=full)
-
-### Jones Chaining
-
-When solving multiple Jones terms, previously solved terms are applied before solving the next:
-
-```yaml
-jones: [G, B]
-```
-
-**Solving process:**
-1. Solve G: `min_G Σ |V^obs - G_i V^model G_j^H|²`
-2. Solve B with G applied:
-   - Corrected visibility: `V' = G_i^{-1} V^obs G_j^{-H}`
-   - Solve: `min_B Σ |V' - B_i V^model B_j^H|²`
-
-## Usage Examples
-
-### Example 1: Basic Gain Calibration
-
-Solve for frequency-averaged complex gains:
-
-```yaml
-# config_gain.yaml
-ms_files: "calibrator.ms"
-output_h5: "gain.h5"
-
-field: "0"
-jones: [G]
-
-solint:
-  time_interval: 2min
-  freq_interval: full
-
-ref_ant: 0
-max_iter: 200
-```
-
-Run:
-```bash
-alakazam solve config_gain.yaml
-```
-
-Output: `gain.h5` containing Jones matrix with shape `(n_time, n_ant, 2, 2)`.
-
-### Example 2: Delay + Bandpass Calibration
-
-Solve delay and bandpass sequentially:
-
-```yaml
-# config_kb.yaml
-ms_files: "calibrator.ms"
-output_h5: "kb_solutions.h5"
-
-jones: [K, B]
-
-solint:
-  time_interval: inf
-  freq_interval: [full, 2MHz]
-
-ref_ant: 0
-```
-
-Run:
-```bash
-alakazam solve config_kb.yaml
-```
-
-**Solving process:**
-1. Solve K on full band → shape `(n_freq, n_ant, 2, 2)`
-2. Apply K, then solve B per 2MHz → shape `(n_freq_chunks, n_ant, 2, 2)`
-
-### Example 3: Full Polarization Calibration
-
-Solve all polarization terms:
-
-```yaml
-# config_full_pol.yaml
-ms_files: "calibrator.ms"
-output_h5: "full_pol.h5"
-
-jones: [Kcross, Xf, D, G]
-
-solint:
-  time_interval: [inf, inf, inf, 2min]
-  freq_interval: full
-
-ref_ant: 0
-```
-
-**Solving order:**
-1. Kcross: Crosshand delay
-2. Xf: Crosshand phase
-3. D: Leakage
-4. G: Parallel-hand gains
-
-### Example 4: Multi-SPW Calibration
-
-ALAKAZAM automatically detects and processes multiple spectral windows:
-
-```yaml
-# config_multi_spw.yaml
-ms_files: "multi_spw.ms"
-output_h5: "solutions_spw{spw}.h5"
-
-spw: "*"                # Process all SPWs
-jones: [K, B, G]
-
-solint:
-  time_interval: inf
-  freq_interval: [full, 1MHz, full]
-
-ref_ant: 0
-```
-
-Output: Separate H5 files per SPW: `solutions_spw0.h5`, `solutions_spw1.h5`, etc.
-
-### Example 5: Applying Calibration
-
-After solving, apply corrections to target field:
-
-```yaml
-# config_apply.yaml
-ms_files: "target.ms"
-
-apply:
-  tables: ["gain.h5", "bandpass.h5"]
-  jones: [G, B]
-  output_col: "CORRECTED_DATA"
-```
-
-Run:
-```bash
-alakazam apply config_apply.yaml
-```
-
-**Application process:**
-1. Load G and B from H5 files
-2. Interpolate to native MS time and frequency grids
-3. Composite: `J_total = B @ G`
-4. Apply: `V_corrected = J_total^{-1} @ V_obs @ J_total^{-H}`
-5. Write to `CORRECTED_DATA` column
-
-### Example 6: Interpolation During Application
-
-Jones solutions are interpolated to match target MS grids:
-
-**Scenario**: Solved G with `time_interval: 10min`, applying to MS with 10s integrations.
-
-```yaml
-# Solve on calibrator
-# config_solve.yaml
-ms_files: "calibrator.ms"
-output_h5: "gain_10min.h5"
-jones: [G]
-solint:
-  time_interval: 10min
-  freq_interval: full
-```
-
-After solving, `gain_10min.h5` contains shape `(6, n_ant, 2, 2)` for 1-hour observation.
-
-```yaml
-# Apply to target
-# config_apply_target.yaml
-ms_files: "target.ms"  # 10s integrations
-apply:
-  tables: ["gain_10min.h5"]
-  jones: [G]
-  output_col: "CORRECTED_DATA"
-```
-
-**Interpolation:**
-- Time: Linear interpolation from 6 samples (10min) → 360 samples (10s)
-- Frequency: Broadcast single solution → all channels
-
-Result: Smooth gain corrections applied at 10s resolution.
-
-## Advanced Configuration Options
-
-### RFI Flagging
-
-```yaml
-rfi:
-  enable: true
-  threshold: 5.0          # MAD threshold
-  per_baseline: true      # Flag per baseline (recommended)
-  algorithm: "MAD"        # Median Absolute Deviation
-```
-
-**Algorithm**: For each baseline and chunk, compute:
-```
-MAD = median(|V - median(V)|)
-σ = 1.4826 × MAD
-```
-Flag visibilities where `|V - median(V)| > threshold × σ`.
-
-### Solver Convergence
-
-```yaml
-max_iter: 200            # Maximum iterations
-tol: 1e-8                # Convergence tolerance on cost function
-ftol: 1e-10              # Function tolerance (optional)
-gtol: 1e-8               # Gradient tolerance (optional)
-```
-
-Solver converges when:
-```
-|Δcost| / cost < tol
-```
-
-### Phase-only Gain Solving
-
-For stable amplitude calibrators:
-
-```yaml
-jones: [G]
-phase_only: true
-```
-
-This constrains `|g_X| = |g_Y| = 1`, solving only for phases.
-
-### Flux Scaling
-
-**Flux scaling** transfers the absolute flux density scale from a flux calibrator to phase calibrators. This is required when phase calibrators are solved with unknown flux densities (assumed 1 Jy).
-
-**Method:**
-
-The gain amplitudes from a flux calibrator (known flux) are compared to those from a phase calibrator (unknown flux):
-
-```
-scale[spw, pol] = <|G_flux|> / <|G_phase|>
-flux_phase[spw, pol] = scale² Jy    (if assumed 1 Jy)
-G_phase_scaled = scale × G_phase
-```
-
-Where averaging is over time and antennas, and X and Y polarizations are scaled independently.
-
-**Configuration:**
-
-```yaml
-jones: [G]
-
-solint:
-  time_interval: 2min
-  freq_interval: full
-
-fluxscale:
-  enable: true
-  reference_field: ["3C286", "3C48"]         # Can be single or multiple
-  reference_table: "flux_cal_G.h5"           # G solutions for reference field(s)
-  transfer_field: ["J1234+5678", "J0927"]    # Can be single or multiple
-```
-
-**Example workflow:**
-
-```yaml
-# Step 1: Solve G for flux calibrator (3C286 with known model)
-ms_files: "flux_cal.ms"
-output_h5: "flux_cal_G.h5"
-field: "3C286"
-jones: [G]
-solint:
-  time_interval: 2min
-  freq_interval: full
-ref_ant: 0
-```
-
-```yaml
-# Step 2: Solve G for phase calibrator and apply fluxscale
-ms_files: "phase_cal.ms"
-output_h5: "phase_cal_G_scaled.h5"
-field: "J1234+5678"
-jones: [G]
-solint:
-  time_interval: 2min
-  freq_interval: full
-ref_ant: 0
-
-fluxscale:
-  enable: true
-  reference_field: "3C286"
-  reference_table: "flux_cal_G.h5"
-  transfer_field: "J1234+5678"
-```
-
-The output `phase_cal_G_scaled.h5` contains flux-scaled gains ready for application to science targets.
-
-**Notes:**
-- Only available for G (gain) mode
-- X and Y polarizations scaled independently
-- Scale factors computed per SPW (averaged over antennas)
-- Preserves native Jones table dimensions
-
-### Parallel Processing
-
-ALAKAZAM automatically parallelizes across:
-- Time chunks (when `time_interval` is specified)
-- Frequency chunks (when `freq_interval` is chunked)
-- SPWs (when multiple spectral windows present)
-
-### Logging and Output
-
-```yaml
-verbose: true            # Rich progress bars and statistics
-log_file: "alakazam.log" # Log file path (optional)
-```
-
-**Output includes:**
-- Progress bars for multi-chunk solving
-- Fit quality statistics (cost reduction)
-- Gain statistics (median amplitude, phase scatter)
-- Reference antenna gains
-- Convergence information
-- Jones chain visualization
-
-## Output Format
-
-Solutions are stored in HDF5 files with the following structure:
-
-```
-/
-├── jones               # Jones matrix dataset (n_time, n_freq, n_ant, 2, 2)
-├── time                # Time samples (MJD seconds)
-├── freq                # Frequency samples (Hz)
-├── antenna_names       # Antenna names
-├── feed_basis          # Feed basis ('linear' or 'circular')
-└── metadata/
-    ├── jones_type      # 'K', 'B', 'G', etc.
-    ├── ref_ant         # Reference antenna index
-    ├── time_interval   # Solution time interval
-    └── freq_interval   # Solution frequency interval
-```
+ALAKAZAM supports 5 Jones solver types, both LINEAR and CIRCULAR feed bases, parallactic angle correction, multi-SPW processing, and sequential calibration chains — all through a single YAML configuration file.
+
+## Features
+
+- **5 Jones solvers**: K (delay), G (gain/bandpass), D (leakage), Xf (cross-phase), Kcross (cross-delay)
+- **Unified G solver**: G serves as both gain and bandpass — behavior controlled by `freq_interval`
+- **Chain initial guess** for all solvers using BFS propagation from reference antenna
+- **Levenberg-Marquardt optimization** via `scipy.optimize.least_squares`
+- **Both LINEAR and CIRCULAR feeds** with automatic detection
+- **Parallactic angle correction** in both solving and applying
+- **Multi-SPW support**: process all SPWs in a single run, stored in one HDF5 file
+- **Memory-safe**: chunked MS loading, memory prediction before allocation
+- **RFI flagging**: MAD-based per-baseline outlier detection (numba JIT)
+- **Proper interpolation**: amplitude/phase (not real/imag) for diagonal Jones
+- **Rich console output**: progress bars, tables, colored logging
+- **HDF5 solutions**: always 5D `(n_time, n_freq, n_ant, 2, 2)` with full metadata
+- **Error estimation** from Jacobian/Hessian after optimization
+- **Quality metrics**: SNR, χ², RMSE, R² per solution cell
+- **Flux scale bootstrapping**
 
 ## Installation
 
 ```bash
-pip install -e .
+pip install .
 ```
 
-Requirements:
-- Python ≥ 3.8
-- NumPy, SciPy
-- python-casacore (MS access)
-- h5py (HDF5 I/O)
-- PyYAML (config parsing)
-- numba (JIT compilation)
-- rich (terminal output, optional)
+### Dependencies
 
-## Command-line Interface
+- Python ≥ 3.9
+- numpy, scipy, numba, h5py, pyyaml
+- python-casacore ≥ 3.5
+- rich (for console output)
+- psutil (optional, for RAM monitoring)
 
-### Solve
+## Quick Start
+
+### 1. Create a YAML config
+
+```yaml
+# calibration.yaml
+ms: observation.ms
+output: solutions.h5
+field: 3C286
+spw: "*"
+ref_ant: 0
+
+jones: [K, G, G]
+time_interval: [inf, inf, 2min]
+freq_interval: [full, 4MHz, full]
+```
+
+### 2. Run
 
 ```bash
-alakazam solve config.yaml
+alakazam run calibration.yaml
 ```
 
-### Apply
+### 3. Apply
 
 ```bash
-alakazam apply config.yaml
+alakazam apply target.ms solutions.h5
 ```
 
-### List Solutions
+### 4. Inspect
 
 ```bash
-alakazam list solutions.h5
+alakazam info solutions.h5
 ```
 
-Output:
+## Configuration Reference
+
+### Top-level fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `ms` | str | *required* | Path to Measurement Set |
+| `output` | str | `calibration.h5` | Output HDF5 file |
+| `jones` | list/str | *required* | Jones types to solve: K, G, D, Xf, Kcross |
+| `field` | str | all | Field name selection |
+| `spw` | str | `*` | SPW selection: `*`, `0`, `0~3`, `0,2,4` |
+| `scans` | str | all | Scan selection |
+| `ref_ant` | int/list | 0 | Reference antenna (per-Jones or global) |
+| `data_col` | str | `DATA` | Data column |
+| `model_col` | str | `MODEL_DATA` | Model column |
+| `apply_parang` | bool | true | Apply parallactic angle correction |
+| `memory_limit_gb` | float | 0 (auto) | Memory limit in GB (0 = 60% of available) |
+
+### Per-Jones fields
+
+These can be a single value (applied to all Jones) or a list matching the length of `jones`:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `time_interval` | str/list | `inf` | Time solint: `inf`, `30s`, `2min`, `0.5h` |
+| `freq_interval` | str/list | `full` | Freq solint: `full`, `spw`, `4MHz`, `128chan` |
+| `phase_only` | bool/list | false | Phase-only mode (G solver) |
+| `rfi_threshold` | float/list | 5.0 | MAD sigma for RFI flagging (0 = disable) |
+| `max_iter` | int/list | 100 | Max LM iterations |
+| `tol` | float/list | 1e-10 | Convergence tolerance |
+
+### Solint behavior by Jones type
+
+| Config | G behavior |
+|--------|-----------|
+| `freq_interval: full` | Traditional gain (one value, all freqs averaged) |
+| `freq_interval: 4MHz` | Bandpass (one value per 4 MHz chunk) |
+| `freq_interval: spw` | Per-SPW (one value per spectral window) |
+| `freq_interval: 128chan` | Per 128 channels |
+
+K and Kcross always keep the frequency axis (never averaged) for delay fitting.
+
+## Jones Types
+
+### K — Antenna Delay
 ```
-Jones terms in solutions.h5:
-  - G: shape (155, 64, 2, 2), time_interval=2min, freq_interval=full
-  - B: shape (32, 64, 2, 2), time_interval=inf, freq_interval=2MHz
+K(ν) = diag(exp(-2πi τ_p ν), exp(-2πi τ_q ν))
 ```
+Fits delay in nanoseconds from phase slope vs frequency. Uses parallel-hand correlations.
 
-## Best Practices
+### G — Complex Diagonal Gain
+```
+G = diag(g_p, g_q) = diag(A_p exp(iφ_p), A_q exp(iφ_q))
+```
+Solves for complex gain per polarization. Also serves as bandpass via `freq_interval`. Uses parallel-hand correlations.
 
-### Calibration Strategy
+### D — Polarization Leakage
+```
+D = [[1, d_pq], [d_qp, 1]]
+```
+Solves for instrumental polarization leakage. Uses all four correlations. Chain initial guess uses cross-hand data.
 
-1. **Delay calibration first**: Solve K on strong calibrator to remove group delays
-2. **Bandpass**: Solve B on bright source with good frequency coverage
-3. **Gain calibration**: Solve G with short intervals on phase calibrator
-4. **Polarization**: Solve D, Xf, Kcross on polarized calibrator
+### Xf — Cross-hand Phase
+```
+Xf = diag(1, exp(iφ_pq))
+```
+Standard diagonal form. Solves for constant phase offset between polarization paths. Uses cross-hand correlations.
 
-### Solution Interval Selection
+### Kcross — Cross-hand Delay
+```
+Kcross(ν) = diag(1, exp(-2πi τ_pq ν))
+```
+Frequency-dependent cross-hand delay. Uses cross-hand correlations.
 
-- **Delay (K)**: `time_interval: inf` (stable over observation)
-- **Bandpass (B)**: `time_interval: inf`, `freq_interval: 1-4MHz` (stable in time, varies with frequency)
-- **Gain (G)**: `time_interval: 1-5min`, `freq_interval: full` (varies with time, achromatic)
-- **Leakage (D)**: `time_interval: inf`, `freq_interval: full` (stable)
-
-### Reference Antenna Selection
-
-Choose reference antenna that:
-- Has low noise
-- Is centrally located
-- Has good coverage to other antennas
-- Is not flagged
-
-### Convergence Issues
-
-If solver fails to converge:
-- Increase `max_iter`
-- Loosen `tol`
-- Check for bad data (high RFI)
-- Verify model quality
-- Try different reference antenna
-
-## Citation
-
-If you use ALAKAZAM, please cite:
+## HDF5 Solution Format
 
 ```
-ALAKAZAM: A Radio Interferometry Calibrator
-Arpan Pal, 2026
+solution.h5
+├── K/
+│   ├── spw_0/
+│   │   ├── jones      (n_t, n_f, n_ant, 2, 2)  complex128
+│   │   ├── time       (n_t,)
+│   │   ├── freq       (n_f,)
+│   │   ├── freq_full  (n_chan,)
+│   │   ├── flags      (n_t, n_f, n_ant)
+│   │   ├── weights    (n_t, n_f)
+│   │   ├── params/delay  (n_t, n_f, n_ant, 2)
+│   │   └── quality/chi2_red, snr, rmse, ...
+│   ├── spw_1/ ...
+│   └── metadata/
+├── G/ ...
+├── observation/
+│   ├── ms_path, antenna_names, working_antennas, feed_basis
+├── config/
+│   └── yaml_content (full config for reproducibility)
+└── creation_time, alakazam_version
+```
+
+## Python API
+
+```python
+import alakazam
+
+# Run pipeline
+config = alakazam.AlakazamConfig(
+    ms_path='obs.ms',
+    output='cal.h5',
+    steps=[
+        alakazam.SolveStep(jones_type='K'),
+        alakazam.SolveStep(jones_type='G', freq_interval='4MHz'),
+        alakazam.SolveStep(jones_type='G', time_interval='2min'),
+    ],
+)
+solutions = alakazam.run_pipeline(config)
+
+# Load solutions
+sols = alakazam.load_solutions('cal.h5')
+k_jones = sols['K'][0]['jones']       # (1, 1, n_ant, 2, 2)
+k_delays = sols['K'][0]['params']['delay']
+
+# Apply
+alakazam.apply_calibration('target.ms', 'cal.h5')
+
+# Flux bootstrapping
+from alakazam.fluxscale import compute_fluxscale
+scale, info = compute_fluxscale(g_cal, g_target, working_ants, ref_ant)
+
+# Jones algebra
+from alakazam.jones import delay_to_jones, jones_multiply
+K = delay_to_jones(delays, freq)
+G = alakazam.gain_to_jones(amp, phase, n_ant)
+J_total = alakazam.compose_jones_chain([K[:, freq_mid], G])
+```
+
+## Architecture
+
+```
+alakazam/
+├── __init__.py          Public API
+├── config.py            YAML parsing + validation
+├── pipeline.py          Single pipeline orchestrator
+├── jones.py             All 2×2 Jones algebra (numba)
+├── apply.py             Vectorized calibration apply
+├── fluxscale.py         Flux bootstrapping
+├── cli.py               CLI: run/apply/info/version
+├── core/
+│   ├── ms_io.py         Chunked MS reading
+│   ├── averaging.py     Flag-aware averaging (numba)
+│   ├── rfi.py           MAD-based RFI flagging (numba)
+│   ├── interpolation.py Amp/phase interpolation
+│   ├── quality.py       χ², SNR, RMSE metrics
+│   └── memory.py        Memory prediction + safe chunking
+├── solvers/
+│   ├── __init__.py      Base class + BFS utilities
+│   ├── registry.py      Solver registry
+│   ├── k_delay.py       K solver
+│   ├── g_gain.py        G solver (also bandpass)
+│   ├── d_leakage.py     D solver
+│   ├── xf_crossphase.py Xf solver
+│   └── kcross_delay.py  Kcross solver
+└── io/
+    └── hdf5.py          Unified HDF5 I/O
 ```
 
 ## License
 
-[Specify license]
+MIT
+
+## Citation
+
+If you use ALAKAZAM in your research, please cite:
+```
+Pal, A. 2026, ALAKAZAM: A Radio Interferometric Calibration Suite for Arrays
+```

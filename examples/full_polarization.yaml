@@ -1,0 +1,20 @@
+# ALAKAZAM Example: Full polarization calibration
+# K → Bandpass → Gain → Leakage → Cross-hand phase
+
+ms: /data/polarization_calibrator.ms
+output: full_pol_cal.h5
+field: 3C286
+spw: "0~3"
+ref_ant: 0
+apply_parang: true
+data_col: DATA
+model_col: MODEL_DATA
+memory_limit_gb: 16.0
+
+jones: [K, G, G, D, Xf]
+
+time_interval: [inf, inf, 2min, inf, inf]
+freq_interval: [full, 4MHz, full, full, full]
+phase_only:    [false, false, false, false, false]
+rfi_threshold: [5.0, 5.0, 5.0, 5.0, 5.0]
+max_iter:      [100, 100, 100, 200, 100]
