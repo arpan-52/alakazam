@@ -1,242 +1,137 @@
 """
-Flag-aware averaging for calibration.
+ALAKAZAM Averaging.
 
-Averages data across time/frequency dimensions while respecting flags.
-Flagged data is excluded from averages.
+Flag-aware averaging per baseline. Numba JIT for performance.
+Handles both time-only and time+freq averaging.
+
+Developed by Arpan Pal 2026, NRAO / NCRA
 """
 
 import numpy as np
+from numba import njit, prange
 from typing import Tuple
 
 
-def average_time_freq(
-    vis_obs: np.ndarray,
-    vis_model: np.ndarray,
-    flags: np.ndarray,
-    avg_time: bool,
-    avg_freq: bool
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+@njit(cache=True)
+def _build_baseline_map(ant1, ant2, n_ant):
+    """Build baseline index map. Returns (bl_map, ant1_out, ant2_out, n_bl)."""
+    n_row = len(ant1)
+    n_bl_max = n_ant * (n_ant - 1) // 2 + n_ant
+    bl_map = -np.ones((n_ant, n_ant), dtype=np.int32)
+    ant1_out = np.zeros(n_bl_max, dtype=np.int32)
+    ant2_out = np.zeros(n_bl_max, dtype=np.int32)
+    n_bl = 0
+
+    for row in range(n_row):
+        a1 = min(ant1[row], ant2[row])
+        a2 = max(ant1[row], ant2[row])
+        if a1 == a2:
+            continue  # skip autocorrelations
+        if bl_map[a1, a2] < 0:
+            bl_map[a1, a2] = n_bl
+            ant1_out[n_bl] = a1
+            ant2_out[n_bl] = a2
+            n_bl += 1
+
+    return bl_map, ant1_out[:n_bl], ant2_out[:n_bl], n_bl
+
+
+@njit(parallel=True, cache=True)
+def average_per_baseline_time_only(
+    vis, flags, ant1, ant2, n_ant
+) -> Tuple:
+    """Average visibilities per baseline over time, keeping frequency axis.
+
+    vis:   (n_row, n_freq, 2, 2) complex128
+    flags: (n_row, n_freq, 2, 2) bool
+    ant1:  (n_row,) int32
+    ant2:  (n_row,) int32
+
+    Returns: (vis_avg, flags_avg, ant1_out, ant2_out)
+        vis_avg:   (n_bl, n_freq, 2, 2)
+        flags_avg: (n_bl, n_freq, 2, 2)
     """
-    Average visibilities across time and/or frequency, respecting flags.
+    n_row = vis.shape[0]
+    n_freq = vis.shape[1]
+    bl_map, a1_out, a2_out, n_bl = _build_baseline_map(ant1, ant2, n_ant)
 
-    Parameters
-    ----------
-    vis_obs : ndarray (n_row, n_chan, 2, 2)
-        Observed visibilities
-    vis_model : ndarray (n_row, n_chan, 2, 2)
-        Model visibilities
-    flags : ndarray (n_row, n_chan, 2, 2) bool
-        Flags (True = flagged)
-    avg_time : bool
-        Average time dimension?
-    avg_freq : bool
-        Average frequency dimension?
+    vis_sum = np.zeros((n_bl, n_freq, 2, 2), dtype=np.complex128)
+    counts = np.zeros((n_bl, n_freq, 2, 2), dtype=np.float64)
 
-    Returns
-    -------
-    vis_obs_avg : ndarray
-        Averaged observed visibilities
-    vis_model_avg : ndarray
-        Averaged model visibilities
-    flags_avg : ndarray
-        Averaged flags (True if ANY flagged)
-    """
-    if not avg_time and not avg_freq:
-        # No averaging
-        return vis_obs, vis_model, flags
-
-    # Mask flagged data with NaN
-    vis_obs_masked = np.where(flags, np.nan, vis_obs)
-    vis_model_masked = np.where(flags, np.nan, vis_model)
-
-    # Determine axes to average
-    axes = []
-    if avg_time:
-        axes.append(0)
-    if avg_freq:
-        axes.append(1)
-
-    # Average (ignoring NaNs)
-    with np.errstate(invalid='ignore'):
-        vis_obs_avg = np.nanmean(vis_obs_masked, axis=tuple(axes))
-        vis_model_avg = np.nanmean(vis_model_masked, axis=tuple(axes))
-
-    # Flags: True if ALL channels flagged (since we use nanmean to exclude bad data)
-    flags_avg = np.all(flags, axis=tuple(axes))
-
-    return vis_obs_avg, vis_model_avg, flags_avg
-
-
-def average_per_baseline(
-    vis_obs: np.ndarray,
-    vis_model: np.ndarray,
-    antenna1: np.ndarray,
-    antenna2: np.ndarray,
-    time: np.ndarray,
-    flags: np.ndarray,
-    avg_time: bool,
-    avg_freq: bool
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Average visibilities per unique baseline.
-
-    Combines multiple time samples of same baseline into single averaged point.
-
-    Parameters
-    ----------
-    vis_obs : ndarray (n_row, n_chan, 2, 2)
-        Observed visibilities
-    vis_model : ndarray (n_row, n_chan, 2, 2)
-        Model visibilities
-    antenna1, antenna2 : ndarray (n_row,)
-        Antenna indices
-    time : ndarray (n_row,)
-        Time stamps
-    flags : ndarray (n_row, n_chan, 2, 2)
-        Flags
-    avg_time : bool
-        Average time within baseline?
-    avg_freq : bool
-        Average frequency?
-
-    Returns
-    -------
-    vis_obs_avg : ndarray (n_bl, ...)
-        Averaged observed visibilities
-    vis_model_avg : ndarray (n_bl, ...)
-        Averaged model visibilities
-    ant1_bl : ndarray (n_bl,)
-        Antenna 1 per baseline
-    ant2_bl : ndarray (n_bl,)
-        Antenna 2 per baseline
-    time_bl : ndarray (n_bl,)
-        Mean time per baseline
-    flags_avg : ndarray (n_bl, ...)
-        Averaged flags
-    """
-    # Get unique baselines
-    baselines = set()
-    for i in range(len(antenna1)):
-        baselines.add((antenna1[i], antenna2[i]))
-
-    baselines = sorted(list(baselines))
-    n_bl = len(baselines)
-
-    # Determine output shape
-    n_chan = vis_obs.shape[1]
-    if avg_freq:
-        out_shape = (n_bl, 2, 2)
-    else:
-        out_shape = (n_bl, n_chan, 2, 2)
-
-    # Allocate output arrays
-    vis_obs_avg = np.zeros(out_shape, dtype=np.complex128)
-    vis_model_avg = np.zeros(out_shape, dtype=np.complex128)
-    flags_avg = np.zeros(out_shape, dtype=bool)
-    ant1_bl = np.zeros(n_bl, dtype=np.int32)
-    ant2_bl = np.zeros(n_bl, dtype=np.int32)
-    time_bl = np.zeros(n_bl, dtype=np.float64)
-
-    # Average per baseline
-    for bl_idx, (a1, a2) in enumerate(baselines):
-        # Find all rows for this baseline
-        mask = (antenna1 == a1) & (antenna2 == a2)
-        rows = np.where(mask)[0]
-
-        if len(rows) == 0:
+    for row in range(n_row):
+        a1 = min(ant1[row], ant2[row])
+        a2 = max(ant1[row], ant2[row])
+        if a1 == a2:
             continue
+        bl_idx = bl_map[a1, a2]
+        if bl_idx < 0:
+            continue
+        for f in range(n_freq):
+            for i in range(2):
+                for j in range(2):
+                    if not flags[row, f, i, j]:
+                        vis_sum[bl_idx, f, i, j] += vis[row, f, i, j]
+                        counts[bl_idx, f, i, j] += 1.0
 
-        # Extract data for this baseline
-        vis_o = vis_obs[rows]
-        vis_m = vis_model[rows]
-        flag = flags[rows]
-        t = time[rows]
+    vis_avg = np.zeros((n_bl, n_freq, 2, 2), dtype=np.complex128)
+    flags_avg = np.zeros((n_bl, n_freq, 2, 2), dtype=np.bool_)
 
-        # Average time and/or freq
-        vis_o_avg, vis_m_avg, flag_avg = average_time_freq(
-            vis_o, vis_m, flag, avg_time=avg_time, avg_freq=avg_freq
-        )
+    for bl in prange(n_bl):
+        for f in range(n_freq):
+            for i in range(2):
+                for j in range(2):
+                    if counts[bl, f, i, j] > 0:
+                        vis_avg[bl, f, i, j] = vis_sum[bl, f, i, j] / counts[bl, f, i, j]
+                    else:
+                        flags_avg[bl, f, i, j] = True
 
-        vis_obs_avg[bl_idx] = vis_o_avg
-        vis_model_avg[bl_idx] = vis_m_avg
-        flags_avg[bl_idx] = flag_avg
-        ant1_bl[bl_idx] = a1
-        ant2_bl[bl_idx] = a2
-        time_bl[bl_idx] = np.mean(t)
-
-    return vis_obs_avg, vis_model_avg, ant1_bl, ant2_bl, time_bl, flags_avg
+    return vis_avg, flags_avg, a1_out, a2_out
 
 
-def average_visibilities(vis_obs: np.ndarray, flags: np.ndarray, jones_type: str) -> Tuple[np.ndarray, np.ndarray]:
+@njit(parallel=True, cache=True)
+def average_per_baseline_full(
+    vis, flags, ant1, ant2, n_ant
+) -> Tuple:
+    """Average visibilities per baseline over time AND frequency.
+
+    vis:   (n_row, n_freq, 2, 2) complex128
+    flags: (n_row, n_freq, 2, 2) bool
+
+    Returns: (vis_avg, flags_avg, ant1_out, ant2_out)
+        vis_avg:   (n_bl, 2, 2)
+        flags_avg: (n_bl, 2, 2)
     """
-    Legacy function for old solver architecture.
+    n_row = vis.shape[0]
+    n_freq = vis.shape[1]
+    bl_map, a1_out, a2_out, n_bl = _build_baseline_map(ant1, ant2, n_ant)
 
-    This is a compatibility stub for the old CalibrationSolver.
-    New code should use average_time_freq or average_per_baseline.
-    """
-    # Simple averaging for backward compatibility
-    # Determine averaging based on Jones type
-    if jones_type.upper() == 'K':
-        # K: average time, keep freq
-        avg_time, avg_freq = True, False
-    else:
-        # G, B, D, Xf: average both
-        avg_time, avg_freq = True, True
+    vis_sum = np.zeros((n_bl, 2, 2), dtype=np.complex128)
+    counts = np.zeros((n_bl, 2, 2), dtype=np.float64)
 
-    # Mask flagged data
-    vis_masked = np.where(flags, np.nan, vis_obs)
+    for row in range(n_row):
+        a1 = min(ant1[row], ant2[row])
+        a2 = max(ant1[row], ant2[row])
+        if a1 == a2:
+            continue
+        bl_idx = bl_map[a1, a2]
+        if bl_idx < 0:
+            continue
+        for f in range(n_freq):
+            for i in range(2):
+                for j in range(2):
+                    if not flags[row, f, i, j]:
+                        vis_sum[bl_idx, i, j] += vis[row, f, i, j]
+                        counts[bl_idx, i, j] += 1.0
 
-    # Determine axes
-    axes = []
-    if avg_time and vis_obs.ndim >= 3:
-        axes.append(0)
-    if avg_freq and vis_obs.ndim >= 3:
-        axes.append(1)
+    vis_avg = np.zeros((n_bl, 2, 2), dtype=np.complex128)
+    flags_avg = np.zeros((n_bl, 2, 2), dtype=np.bool_)
 
-    if axes:
-        with np.errstate(invalid='ignore'):
-            vis_avg = np.nanmean(vis_masked, axis=tuple(axes))
-        flags_avg = np.all(flags, axis=tuple(axes))
-    else:
-        vis_avg = vis_obs
-        flags_avg = flags
+    for bl in prange(n_bl):
+        for i in range(2):
+            for j in range(2):
+                if counts[bl, i, j] > 0:
+                    vis_avg[bl, i, j] = vis_sum[bl, i, j] / counts[bl, i, j]
+                else:
+                    flags_avg[bl, i, j] = True
 
-    return vis_avg, flags_avg
-
-
-def average_model_visibilities(vis_model: np.ndarray, jones_type: str) -> np.ndarray:
-    """
-    Legacy function for old solver architecture.
-
-    This is a compatibility stub for the old CalibrationSolver.
-    New code should use average_time_freq or average_per_baseline.
-    """
-    # Determine averaging based on Jones type
-    if jones_type.upper() == 'K':
-        # K: average time, keep freq
-        avg_time, avg_freq = True, False
-    else:
-        # G, B, D, Xf: average both
-        avg_time, avg_freq = True, True
-
-    # Determine axes
-    axes = []
-    if avg_time and vis_model.ndim >= 3:
-        axes.append(0)
-    if avg_freq and vis_model.ndim >= 3:
-        axes.append(1)
-
-    if axes:
-        vis_avg = np.mean(vis_model, axis=tuple(axes))
-    else:
-        vis_avg = vis_model
-
-    return vis_avg
-
-
-__all__ = [
-    'average_time_freq',
-    'average_per_baseline',
-    'average_visibilities',
-    'average_model_visibilities'
-]
+    return vis_avg, flags_avg, a1_out, a2_out

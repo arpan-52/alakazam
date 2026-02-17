@@ -1,44 +1,13 @@
-# JACKAL K Delay Calibration Configuration
-# CLI: jackal run k_delay.yaml
-# Python: from jackal import solve_from_yaml; solve_from_yaml('k_delay.yaml')
+# ALAKAZAM Example: K delay calibration
+# Solves antenna delays from a calibrator observation
 
-solve:
-  - jones: [K]                    # Single Jones type
-    ms: observation.ms
+ms: /data/calibrator.ms
+output: delay_cal.h5
+field: 3C286
+spw: "*"
+ref_ant: 0
 
-    # Output
-    output: k_delay.h5
-
-    # Antenna & Feed
-    ref_ant: 0
-    feed_basis: linear            # or 'circular', 'auto'
-
-    # MS Selection
-    field: 3C286                  # Calibrator field
-    spw: '0'                      # First spectral window
-                                   # Or with channel selection: '0:250~1800'
-                                   # (excludes edge channels for better delay fit)
-    scans: 1~10                   # Calibrator scans
-                                   # Single scan: 10 or '10'
-                                   # Range: '10~20'
-                                   # Multiple: '10,15,20'
-
-    # Solution Intervals
-    time_interval: inf            # One solution for entire observation
-    freq_interval: 4MHz           # 4 MHz frequency intervals
-
-    # Column Selection
-    data_col: DATA
-    model_col: MODEL_DATA
-
-    # RFI Flagging
-    rfi_enable: true
-    rfi_threshold: 5.0            # 5-sigma MAD threshold
-
-    # Solver Parameters
-    max_iter: 100
-    tol: 1.0e-10
-
-    # Pre-apply (empty for first calibration)
-    pre_apply_file: []
-    pre_apply_jones: []
+jones: K
+time_interval: inf     # Single solution for full observation
+freq_interval: full    # Use all channels (need freq axis for delay)
+rfi_threshold: 5.0
