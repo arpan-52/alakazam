@@ -1,93 +1,64 @@
-"""
-ALAKAZAM Memory Prediction.
+"""ALAKAZAM Memory Management.
 
-Estimates peak memory usage before loading data.
-Actually used by the pipeline to decide chunk sizes.
+3-tier strategy:
+  T1: Full SPW fits in RAM      → single load, all cells parallel
+  T2: N slots fit               → batched load, N slots at a time
+  T3: One slot too big          → pseudo-chunk (progressive accumulation)
 
 Developed by Arpan Pal 2026, NRAO / NCRA
 """
 
+import psutil
 import numpy as np
 import logging
 
 logger = logging.getLogger("alakazam")
 
-GB = 1024**3
-
-try:
-    import psutil
-    HAS_PSUTIL = True
-except ImportError:
-    HAS_PSUTIL = False
+BYTES_PER_COMPLEX = 16  # complex128
 
 
 def get_available_ram_gb() -> float:
-    """Get available system RAM in GB."""
-    if HAS_PSUTIL:
-        return psutil.virtual_memory().available / GB
-    return 8.0  # conservative default
+    """Return available system RAM in GB."""
+    return psutil.virtual_memory().available / (1024 ** 3)
 
 
-def estimate_chunk_memory_gb(
-    n_rows: int, n_chan: int, n_ant: int, jones_type: str = "G"
-) -> float:
-    """Estimate memory for one chunk in GB.
-
-    Accounts for: vis_obs, vis_model, flags, averaging accumulators,
-    solver Jacobian, temporaries.
-    """
-    # Input data: 2 visibility arrays + flags
-    # Each vis: n_rows × n_chan × 4 × 16 bytes (complex128)
-    # Flags: n_rows × n_chan × 4 × 1 byte
-    vis_bytes = n_rows * n_chan * 4 * 16 * 2  # obs + model
-    flag_bytes = n_rows * n_chan * 4 * 1
-    input_bytes = vis_bytes + flag_bytes
-
-    # Averaging accumulators: n_bl × n_chan × 4 × 24 bytes (sum + count + output)
-    n_bl = n_ant * (n_ant - 1) // 2
-    avg_bytes = n_bl * n_chan * 4 * 24
-
-    # Solver: Jacobian is the big one
-    # Jacobian shape: (n_residuals, n_params)
-    # n_residuals ≈ n_bl × 4 (or n_bl × n_chan × 4 for K)
-    # n_params ≈ n_ant × 4
-    if jones_type in ("K", "KCROSS"):
-        n_resid = n_bl * n_chan * 4
-    else:
-        n_resid = n_bl * 4  # after freq averaging
-    n_params = n_ant * 4
-    jac_bytes = n_resid * n_params * 8  # float64
-
-    # Temporaries: ~2× input
-    temp_bytes = input_bytes
-
-    total = input_bytes + avg_bytes + jac_bytes + temp_bytes
-    return total / GB
-
-
-def compute_safe_time_chunk(
-    n_time: int,
-    n_rows_per_time: int,
+def estimate_slot_memory_gb(
+    n_baseline: int,
     n_chan: int,
     n_ant: int,
-    jones_type: str = "G",
-    memory_limit_gb: float = 0.0,
-    safety_factor: float = 0.6,
-) -> int:
-    """Compute maximum number of time steps per chunk that fits in memory.
+    n_matrices: int = 3,  # obs, model, preapply
+) -> float:
+    """Estimate RAM for one solint slot in GB."""
+    vis_bytes = n_baseline * n_chan * 4 * BYTES_PER_COMPLEX * n_matrices
+    jones_bytes = n_ant * n_chan * 4 * BYTES_PER_COMPLEX
+    return (vis_bytes + jones_bytes) / (1024 ** 3)
 
-    Returns n_time_per_chunk (at least 1).
+
+def tier_strategy(
+    n_slots: int,
+    n_baseline: int,
+    n_chan: int,
+    n_ant: int,
+    limit_gb: float = 0.0,
+) -> tuple:
+    """Return (tier, batch_size).
+
+    tier 1 → load all slots at once
+    tier 2 → load batch_size slots at a time
+    tier 3 → one slot at a time (pseudo-chunk)
     """
-    if memory_limit_gb <= 0:
-        available = get_available_ram_gb() * safety_factor
-    else:
-        available = memory_limit_gb
+    avail = limit_gb if limit_gb > 0 else get_available_ram_gb() * 0.7
+    slot_gb = estimate_slot_memory_gb(n_baseline, n_chan, n_ant)
 
-    # Binary search for max time steps
-    for n_t in range(n_time, 0, -1):
-        n_rows = n_t * n_rows_per_time
-        mem = estimate_chunk_memory_gb(n_rows, n_chan, n_ant, jones_type)
-        if mem <= available:
-            return n_t
+    if slot_gb == 0:
+        return (1, n_slots)
 
-    return 1  # minimum
+    if slot_gb * n_slots <= avail:
+        return (1, n_slots)
+
+    batch = max(1, int(avail / slot_gb))
+    if batch >= n_slots:
+        return (1, n_slots)
+    if batch >= 1:
+        return (2, batch)
+    return (3, 1)

@@ -1,0 +1,73 @@
+# Full multi-field solve with fluxscale and interpolated apply
+#
+# MS contains: 3C147 (flux ref), 3C286 (flux ref), PKS1934 (gain cal), J0538 (gain cal)
+#
+# Chain:
+#   Step 1: solve K on [3C147]
+#   Step 2: solve G on [3C147, 3C286]  — preapply step 1 K first
+#   Step 3: solve G on [PKS1934, J0538] — preapply K + G from steps 1,2
+#
+# Then fluxscale G from PKS1934 and J0538 using 3C147 as reference
+# Then apply to science target
+
+solve:
+  - ms: all_cals.ms
+    output: cal.h5
+    ref_ant: 0
+    data_col: DATA
+    model_col: MODEL_DATA
+    apply_parang: false
+    memory_limit_gb: 0
+    rfi_threshold: 5.0
+    max_iter: 100
+    tol: 1.0e-10
+
+    jones:         [K,       G,                     G               ]
+    field:         [[3C147], [3C147, 3C286],         [PKS1934, J0538]]
+    time_interval: [inf,     inf,                    5min            ]
+    freq_interval: [full,    full,                   full            ]
+    phase_only:    [false,   false,                  false           ]
+
+    # How previous Jones terms are interpolated when pre-applying to data
+    # before each step's solve
+    # absent = automatic chain (each step preapplies all prior steps)
+    preapply_time_interp: [exact, nearest_time, nearest_time]
+
+    # scans absent → all scans for each field
+    # spw absent   → all SPWs
+
+
+fluxscale:
+  - reference_table: cal.h5
+    reference_field: 3C147
+    transfer_table: cal.h5
+    transfer_field: [PKS1934, J0538]
+    output: cal_scaled.h5
+    jones_type: G
+    # spw absent → all SPWs
+
+
+apply:
+  - ms: science.ms
+    output_col: CORRECTED_DATA
+    target_field: NGC1234
+    apply_parang: false
+
+    # field_select controls how solutions are picked from the table
+    #   nearest_time → closest solution in time across all fields
+    #   nearest_sky  → closest field on sky, then nearest in time
+    #   pinned       → use exactly solution_field (requires solution_field)
+    # time_interp controls interpolation within selected field
+    #   exact        → stamp solint block (no interp in time or freq)
+    #   nearest_time → nearest slot
+    #   linear       → linear in time + freq
+    #   cubic        → cubic spline in time + freq
+
+    jones:        [K,      G,             G            ]
+    tables:       [cal.h5, cal_scaled.h5, cal_scaled.h5]
+    field_select: [nearest_time, nearest_sky,  nearest_sky  ]
+    time_interp:  [exact,        linear,        cubic        ]
+
+    # solution_field only needed when field_select=pinned
+    # spw absent → all SPWs
+    # target_scans absent → all scans

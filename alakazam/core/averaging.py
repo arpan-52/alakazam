@@ -1,137 +1,128 @@
-"""
-ALAKAZAM Averaging.
+"""ALAKAZAM Averaging.
 
-Flag-aware averaging per baseline. Numba JIT for performance.
-Handles both time-only and time+freq averaging.
+Average visibilities over time and/or frequency for solver input.
 
 Developed by Arpan Pal 2026, NRAO / NCRA
 """
 
 import numpy as np
 from numba import njit, prange
-from typing import Tuple
+import logging
 
-
-@njit(cache=True)
-def _build_baseline_map(ant1, ant2, n_ant):
-    """Build baseline index map. Returns (bl_map, ant1_out, ant2_out, n_bl)."""
-    n_row = len(ant1)
-    n_bl_max = n_ant * (n_ant - 1) // 2 + n_ant
-    bl_map = -np.ones((n_ant, n_ant), dtype=np.int32)
-    ant1_out = np.zeros(n_bl_max, dtype=np.int32)
-    ant2_out = np.zeros(n_bl_max, dtype=np.int32)
-    n_bl = 0
-
-    for row in range(n_row):
-        a1 = min(ant1[row], ant2[row])
-        a2 = max(ant1[row], ant2[row])
-        if a1 == a2:
-            continue  # skip autocorrelations
-        if bl_map[a1, a2] < 0:
-            bl_map[a1, a2] = n_bl
-            ant1_out[n_bl] = a1
-            ant2_out[n_bl] = a2
-            n_bl += 1
-
-    return bl_map, ant1_out[:n_bl], ant2_out[:n_bl], n_bl
-
-
-@njit(parallel=True, cache=True)
-def average_per_baseline_time_only(
-    vis, flags, ant1, ant2, n_ant
-) -> Tuple:
-    """Average visibilities per baseline over time, keeping frequency axis.
-
-    vis:   (n_row, n_freq, 2, 2) complex128
-    flags: (n_row, n_freq, 2, 2) bool
-    ant1:  (n_row,) int32
-    ant2:  (n_row,) int32
-
-    Returns: (vis_avg, flags_avg, ant1_out, ant2_out)
-        vis_avg:   (n_bl, n_freq, 2, 2)
-        flags_avg: (n_bl, n_freq, 2, 2)
-    """
-    n_row = vis.shape[0]
-    n_freq = vis.shape[1]
-    bl_map, a1_out, a2_out, n_bl = _build_baseline_map(ant1, ant2, n_ant)
-
-    vis_sum = np.zeros((n_bl, n_freq, 2, 2), dtype=np.complex128)
-    counts = np.zeros((n_bl, n_freq, 2, 2), dtype=np.float64)
-
-    for row in range(n_row):
-        a1 = min(ant1[row], ant2[row])
-        a2 = max(ant1[row], ant2[row])
-        if a1 == a2:
-            continue
-        bl_idx = bl_map[a1, a2]
-        if bl_idx < 0:
-            continue
-        for f in range(n_freq):
-            for i in range(2):
-                for j in range(2):
-                    if not flags[row, f, i, j]:
-                        vis_sum[bl_idx, f, i, j] += vis[row, f, i, j]
-                        counts[bl_idx, f, i, j] += 1.0
-
-    vis_avg = np.zeros((n_bl, n_freq, 2, 2), dtype=np.complex128)
-    flags_avg = np.zeros((n_bl, n_freq, 2, 2), dtype=np.bool_)
-
-    for bl in prange(n_bl):
-        for f in range(n_freq):
-            for i in range(2):
-                for j in range(2):
-                    if counts[bl, f, i, j] > 0:
-                        vis_avg[bl, f, i, j] = vis_sum[bl, f, i, j] / counts[bl, f, i, j]
-                    else:
-                        flags_avg[bl, f, i, j] = True
-
-    return vis_avg, flags_avg, a1_out, a2_out
+logger = logging.getLogger("alakazam")
 
 
 @njit(parallel=True, cache=True)
 def average_per_baseline_full(
-    vis, flags, ant1, ant2, n_ant
-) -> Tuple:
-    """Average visibilities per baseline over time AND frequency.
+    vis: np.ndarray,      # (n_row, n_chan, 2, 2) complex128
+    flags: np.ndarray,    # (n_row, n_chan, 2, 2) bool
+    ant1: np.ndarray,     # (n_row,) int32
+    ant2: np.ndarray,
+    n_ant: int,
+) -> tuple:
+    """Average all rows per unique baseline (time+freq average).
 
-    vis:   (n_row, n_freq, 2, 2) complex128
-    flags: (n_row, n_freq, 2, 2) bool
-
-    Returns: (vis_avg, flags_avg, ant1_out, ant2_out)
-        vis_avg:   (n_bl, 2, 2)
-        flags_avg: (n_bl, 2, 2)
+    Returns: (avg_vis, avg_flags, out_ant1, out_ant2)
+      avg_vis: (n_bl, 2, 2)
+      avg_flags: (n_bl, 2, 2) bool — True if all flagged
     """
-    n_row = vis.shape[0]
-    n_freq = vis.shape[1]
-    bl_map, a1_out, a2_out, n_bl = _build_baseline_map(ant1, ant2, n_ant)
+    # Build baseline index map
+    n_bl = (n_ant * (n_ant - 1)) // 2
+    bl_map = np.full((n_ant, n_ant), -1, dtype=np.int64)
+    out_ant1 = np.empty(n_bl, dtype=np.int32)
+    out_ant2 = np.empty(n_bl, dtype=np.int32)
+    idx = 0
+    for i in range(n_ant):
+        for j in range(i + 1, n_ant):
+            bl_map[i, j] = idx
+            out_ant1[idx] = i
+            out_ant2[idx] = j
+            idx += 1
 
-    vis_sum = np.zeros((n_bl, 2, 2), dtype=np.complex128)
-    counts = np.zeros((n_bl, 2, 2), dtype=np.float64)
+    avg_vis   = np.zeros((n_bl, 2, 2), dtype=np.complex128)
+    avg_wt    = np.zeros((n_bl, 2, 2), dtype=np.float64)
+    avg_flags = np.ones((n_bl, 2, 2), dtype=np.bool_)
 
-    for row in range(n_row):
-        a1 = min(ant1[row], ant2[row])
-        a2 = max(ant1[row], ant2[row])
-        if a1 == a2:
+    n_row  = vis.shape[0]
+    n_chan = vis.shape[1]
+
+    for r in prange(n_row):
+        a1 = ant1[r]
+        a2 = ant2[r]
+        if a1 >= a2:
             continue
-        bl_idx = bl_map[a1, a2]
-        if bl_idx < 0:
+        bl = bl_map[a1, a2]
+        if bl < 0:
             continue
-        for f in range(n_freq):
-            for i in range(2):
-                for j in range(2):
-                    if not flags[row, f, i, j]:
-                        vis_sum[bl_idx, i, j] += vis[row, f, i, j]
-                        counts[bl_idx, i, j] += 1.0
-
-    vis_avg = np.zeros((n_bl, 2, 2), dtype=np.complex128)
-    flags_avg = np.zeros((n_bl, 2, 2), dtype=np.bool_)
+        for c in range(n_chan):
+            for p in range(2):
+                for q in range(2):
+                    if not flags[r, c, p, q]:
+                        avg_vis[bl, p, q]   += vis[r, c, p, q]
+                        avg_wt[bl, p, q]    += 1.0
+                        avg_flags[bl, p, q]  = False
 
     for bl in prange(n_bl):
-        for i in range(2):
-            for j in range(2):
-                if counts[bl, i, j] > 0:
-                    vis_avg[bl, i, j] = vis_sum[bl, i, j] / counts[bl, i, j]
-                else:
-                    flags_avg[bl, i, j] = True
+        for p in range(2):
+            for q in range(2):
+                if avg_wt[bl, p, q] > 0:
+                    avg_vis[bl, p, q] /= avg_wt[bl, p, q]
 
-    return vis_avg, flags_avg, a1_out, a2_out
+    return avg_vis, avg_flags, out_ant1, out_ant2
+
+
+@njit(parallel=True, cache=True)
+def average_per_baseline_time_only(
+    vis: np.ndarray,      # (n_row, n_chan, 2, 2) complex128
+    flags: np.ndarray,
+    ant1: np.ndarray,
+    ant2: np.ndarray,
+    n_ant: int,
+) -> tuple:
+    """Average all rows per unique baseline in time only (keep freq axis).
+
+    Returns: (avg_vis, avg_flags, out_ant1, out_ant2)
+      avg_vis: (n_bl, n_chan, 2, 2)
+    """
+    n_bl = (n_ant * (n_ant - 1)) // 2
+    bl_map = np.full((n_ant, n_ant), -1, dtype=np.int64)
+    out_ant1 = np.empty(n_bl, dtype=np.int32)
+    out_ant2 = np.empty(n_bl, dtype=np.int32)
+    idx = 0
+    for i in range(n_ant):
+        for j in range(i + 1, n_ant):
+            bl_map[i, j] = idx
+            out_ant1[idx] = i
+            out_ant2[idx] = j
+            idx += 1
+
+    n_chan = vis.shape[1]
+    avg_vis   = np.zeros((n_bl, n_chan, 2, 2), dtype=np.complex128)
+    avg_wt    = np.zeros((n_bl, n_chan, 2, 2), dtype=np.float64)
+    avg_flags = np.ones((n_bl, n_chan, 2, 2), dtype=np.bool_)
+
+    n_row = vis.shape[0]
+    for r in prange(n_row):
+        a1 = ant1[r]
+        a2 = ant2[r]
+        if a1 >= a2:
+            continue
+        bl = bl_map[a1, a2]
+        if bl < 0:
+            continue
+        for c in range(n_chan):
+            for p in range(2):
+                for q in range(2):
+                    if not flags[r, c, p, q]:
+                        avg_vis[bl, c, p, q]   += vis[r, c, p, q]
+                        avg_wt[bl, c, p, q]    += 1.0
+                        avg_flags[bl, c, p, q]  = False
+
+    for bl in prange(n_bl):
+        for c in range(n_chan):
+            for p in range(2):
+                for q in range(2):
+                    if avg_wt[bl, c, p, q] > 0:
+                        avg_vis[bl, c, p, q] /= avg_wt[bl, c, p, q]
+
+    return avg_vis, avg_flags, out_ant1, out_ant2

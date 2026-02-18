@@ -1,0 +1,26 @@
+# Simple KGB calibration — one MS, all cals, one field per step
+
+solve:
+  - ms: all_cals.ms
+    output: cal.h5
+    ref_ant: 0
+    data_col: DATA
+    model_col: MODEL_DATA
+
+    jones:         [K,       G      ]
+    field:         [[3C286], [3C286]]
+    time_interval: [inf,     5min   ]
+    freq_interval: [full,    full   ]
+    phase_only:    [false,   false  ]
+
+    preapply_time_interp: [exact, nearest_time]
+
+apply:
+  - ms: science.ms
+    output_col: CORRECTED_DATA
+    target_field: NGC1234
+
+    jones:         [K,       G      ]
+    tables:        [cal.h5,  cal.h5 ]
+    field_select:  [nearest_time, nearest_time]
+    time_interp:   [exact,   linear ]

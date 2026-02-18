@@ -1,0 +1,33 @@
+# External preapply example
+# Use solutions from a previous run as a starting point
+# before solving a new set of gains
+
+solve:
+  - ms: new_obs.ms
+    output: new_cal.h5
+    ref_ant: 0
+
+    jones:         [G,      G              ]
+    field:         [[3C286],[PKS1934, J0538]]
+    time_interval: [inf,    5min           ]
+    freq_interval: [full,   full           ]
+    phase_only:    [false,  false          ]
+    preapply_time_interp: [nearest_time, nearest_time]
+
+    # Apply K from a previous session before starting the solve chain
+    external_preapply:
+      tables:       [old_session.h5]
+      jones:        [K]
+      field_select: [nearest_time]
+      time_interp:  [exact]
+      # fields absent → auto-select via field_select
+
+apply:
+  - ms: new_science.ms
+    output_col: CORRECTED_DATA
+    target_field: NGC5128
+
+    jones:        [K,              G         ]
+    tables:       [old_session.h5, new_cal.h5]
+    field_select: [nearest_time,   nearest_sky]
+    time_interp:  [exact,          linear     ]

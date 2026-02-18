@@ -1,20 +1,26 @@
+# Full polarisation calibration: K G D Xf
+# Single MS with one field
+
 solve:
-  - jones: [K, G, G, D, Xf]
-    ms: flux_cal.ms
-    field: 3C286
-    spw: "0~3"
+  - ms: pol_cal.ms
+    output: pol_cal.h5
     ref_ant: 0
-    output: polcal.h5
-    time_interval: [inf, inf, 2min, inf, inf]
-    freq_interval: [full, 4MHz, full, full, full]
-    phase_only: [false, false, false, false, false]
-    rfi_threshold: 5.0
-    max_iter: 200
-    memory_limit_gb: 16.0
+    apply_parang: true
+
+    jones:         [K,       G,      D,      Xf    ]
+    field:         [[3C286], [3C286],[3C286],[3C286]]
+    time_interval: [inf,     inf,    inf,    inf   ]
+    freq_interval: [full,    full,   full,   full  ]
+    phase_only:    [false,   false,  false,  false ]
+    preapply_time_interp: [exact, nearest_time, nearest_time, nearest_time]
 
 apply:
-  - ms: target.ms
-    jones: [K, G, G, D, Xf]
-    tables: [polcal.h5]
+  - ms: science.ms
     output_col: CORRECTED_DATA
-    spw: "0~3"
+    target_field: CasA
+    apply_parang: true
+
+    jones:        [K,         G,         D,         Xf       ]
+    tables:       [pol_cal.h5,pol_cal.h5,pol_cal.h5,pol_cal.h5]
+    field_select: [nearest_time, nearest_time, nearest_time, nearest_time]
+    time_interp:  [exact,     linear,     nearest_time, nearest_time]
