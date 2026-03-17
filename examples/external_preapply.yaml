@@ -1,35 +1,28 @@
-# External preapply — inject solutions from a previous run
-# before the current solve chain starts
+# Use solutions from a previous run as preapply
+# Solve only G1 with K0 and G0 from a previous cal table
 
 solve:
-  - ms: new_obs.ms
-    output: new_cal.h5
-    ref_ant: 0
+  - ms: newdata.ms
+    output: newcal.h5
+    ref_ant: C04
     solver_backend: jax_scipy
 
-    jones:         [G,      G              ]
-    field:         [[3C286],[PKS1934, J0538]]
-    time_interval: [inf,    5min           ]
-    freq_interval: [full,   full           ]
-    phase_only:    [false,  false          ]
-    preapply_time_interp: [nearest, nearest]
+    jones: [G]
+    field: [3C286]
+    time_interval: 2min
+    freq_interval: full
+    preapply_time_interp: nearest
 
-    # Apply K from a previous session before the chain starts
-    # External preapply stays in the stack for all steps:
-    #   Before step 1: preapply old K
-    #   Before step 2: preapply old K + step 1 G
     external_preapply:
-      tables:       [old_session.h5]
-      jones:        [K]
-      field_select: [nearest_time]
-      time_interp:  [exact]
+      tables: [oldcal.h5, oldcal.h5]
+      jones: [K0, G0]
+      field_select: [nearest_time, nearest_time]
+      time_interp: [nearest, nearest]
 
 apply:
-  - ms: new_science.ms
+  - ms: newdata.ms
     output_col: CORRECTED_DATA
-    target_field: NGC5128
-
-    jones:        [K,              G         ]
-    tables:       [old_session.h5, new_cal.h5]
-    field_select: [nearest_time,   nearest_sky]
-    time_interp:  [exact,          linear     ]
+    jones:  [K0, G0, G0]
+    tables: [oldcal.h5, oldcal.h5, newcal.h5]
+    field_select: nearest_time
+    time_interp: [nearest, nearest, linear]

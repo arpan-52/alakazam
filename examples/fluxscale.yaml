@@ -1,0 +1,31 @@
+# Solve gains on both calibrators, then bootstrap flux from 3C286 to 3C147
+
+solve:
+  - ms: allcals.ms
+    output: gains.h5
+    ref_ant: C04
+    solver_backend: jax_scipy
+
+    jones: [K, G]
+    field:
+      - [3C286, 3C147]
+      - [3C286, 3C147]
+    time_interval: [scan, 5min]
+    freq_interval: [full, full]
+    preapply_time_interp: [exact, nearest]
+
+fluxscale:
+  - reference_table: gains.h5
+    reference_field: 3C286
+    transfer_table: gains.h5
+    transfer_field: [3C147]
+    output: gains_scaled.h5
+    jones_type: G0
+
+apply:
+  - ms: science.ms
+    output_col: CORRECTED_DATA
+    jones:  [K0, G0]
+    tables: [gains.h5, gains_scaled.h5]
+    field_select: [nearest_time, nearest_time]
+    time_interp: [nearest, linear]
