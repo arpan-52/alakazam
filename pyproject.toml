@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alakazam"
+version = "1.0.0"
+description = "Radio interferometric calibration pipeline"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "h5py>=3.8",
+    "pyyaml>=6.0",
+    "numba>=0.57",
+    "psutil>=5.9",
+    "rich>=13.0",
+    "jax>=0.4",
+    "jaxlib>=0.4",
+    "python-casacore>=3.5",
+]
+
+[project.optional-dependencies]
+torch = ["torch>=2.0"]
+casacore = ["python-casacore>=3.5"]
+all = ["jax>=0.4", "jaxlib>=0.4", "torch>=2.0", "python-casacore>=3.5"]
+
+[project.scripts]
+alakazam = "alakazam.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["alakazam*"]

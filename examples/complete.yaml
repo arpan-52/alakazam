@@ -1,0 +1,90 @@
+# ALAKAZAM v1.0 — Complete calibration example
+#
+# Demonstrates: K G D KC CP full chain, fluxscale, apply with parang
+#
+# Every per-step parameter can be:
+#   - A scalar (applied to all steps): phase_only: false
+#   - A list (one per step): time_interval: [inf, 5min, inf, inf, inf]
+#
+# SPW uses CASA-native syntax:
+#   "0"              → SPW 0 all channels
+#   "0:127~156"      → SPW 0 channels 127-156
+#   "0:10~500,1,2"   → SPW 0 ch10-500, SPW 1 all, SPW 2 all
+
+solve:
+  - ms: calibrators.ms
+    output: cal.h5
+    ref_ant: 9
+    data_col: DATA
+    model_col: MODEL_DATA
+    apply_parang: true             # correct parallactic angle before solving
+    solver_backend: jax_scipy      # jax_scipy | torch_lbfgs
+    rfi_threshold: 5.0
+    max_iter: 100
+    tol: 1.0e-10
+    n_workers: 0                   # 0 = auto
+
+    # Jones chain
+    jones: [K, G, D, KC, CP]
+
+    # Fields per step — scalar or per-step lists
+    field:
+      - [3C286]                    # K: solve on 3C286
+      - [3C286, 3C147]            # G: solve on both (independent)
+      - [3C286]                    # D: leakage from polarised cal
+      - [3C286]                    # KC: cross-delay from pol cal
+      - [3C286]                    # CP: cross-phase from pol cal
+
+    # Solint per step
+    time_interval: [inf, 5min, inf, inf, inf]
+    freq_interval: [full, full, full, full, full]
+
+    # K and KC solve across frequency (keep freq axis)
+    # G, D, CP average across frequency (freq-independent Jones)
+
+    # Phase-only: scalar = same for all steps
+    phase_only: false
+
+    # How prior Jones steps are interpolated for preapply
+    preapply_time_interp: [exact, nearest, nearest, nearest, nearest]
+
+    # SPW selection (CASA-native)
+    spw: "0,1,2"
+
+    # Per-step SPW override (optional)
+    # step_spw: ["0,1,2", "0,1,2", "0:10~500", "0,1,2", "0,1,2"]
+
+    # Scan selection (optional, absent = all)
+    # scans: [[1,2], [1,2,3,4], [5,6], [5,6], [5,6]]
+
+
+# Fluxscale: bootstrap from 3C286 to gain calibrators
+fluxscale:
+  - reference_table: cal.h5
+    reference_field: 3C286
+    transfer_table: cal.h5
+    transfer_field: [3C147]
+    output: cal_scaled.h5
+    jones_type: G
+    # Uses iterative sigma-clipping to reject outlier antennas
+
+
+# Apply to science target
+apply:
+  - ms: science.ms
+    output_col: CORRECTED_DATA
+    target_field: NGC1234
+    apply_parang: true              # also correct parang on apply
+    propagate_flags: true           # write solution flags to MS FLAG
+
+    jones:  [K, G, D, KC, CP]
+    tables: [cal.h5, cal_scaled.h5, cal.h5, cal.h5, cal.h5]
+
+    # Field selection: how to pick which field's solutions
+    field_select: [nearest_time, nearest_sky, nearest_time, nearest_time, nearest_time]
+
+    # Time interpolation per term
+    time_interp: [exact, linear, nearest, exact, exact]
+
+    # solution_field only needed for field_select=pinned
+    # solution_field: [null, null, null, null, null]

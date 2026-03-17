@@ -1,0 +1,37 @@
+# Full polarisation calibration: K G D KC CP
+# Each step has a different solint — preapply interpolates correctly
+
+solve:
+  - ms: polcal.ms
+    output: polcal.h5
+    ref_ant: 9
+    apply_parang: true
+    solver_backend: jax_scipy
+
+    jones:         [K,       G,      D,      KC,     CP    ]
+    field:         [[3C286], [3C286],[3C286],[3C286],[3C286]]
+    time_interval: [inf,     5min,   inf,    inf,    inf   ]
+    freq_interval: [full,    full,   full,   full,   full  ]
+    phase_only:    [false,   false,  false,  false,  false ]
+    preapply_time_interp: [exact, nearest, nearest, nearest, nearest]
+
+    # K solved with solint=inf (one solution for whole obs)
+    # G solved with solint=5min (many solutions)
+    # D solved with solint=inf (one solution)
+    # KC solved with solint=inf (one global cross-delay)
+    # CP solved with solint=inf (one global cross-phase)
+    #
+    # Before step 3 (D), preapply K (exact, solint=inf) + G (nearest, solint=5min)
+    # The different solints are handled by interpolation: G's 5min solutions
+    # are interpolated (nearest) onto the D solve's data timestamps.
+
+apply:
+  - ms: science.ms
+    output_col: CORRECTED_DATA
+    target_field: CasA
+    apply_parang: true
+
+    jones:        [K,          G,          D,          KC,         CP        ]
+    tables:       [polcal.h5,  polcal.h5,  polcal.h5,  polcal.h5,  polcal.h5]
+    field_select: [nearest_time, nearest_time, nearest_time, nearest_time, nearest_time]
+    time_interp:  [exact,      linear,      nearest,    exact,      exact    ]
