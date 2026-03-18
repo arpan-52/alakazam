@@ -3,7 +3,7 @@
 Jones types: K (parallel delay), G (gains), D (leakage),
              KC (cross delay), CP (cross phase)
 
-Solver backends: jax_scipy (default, CPU/GPU auto), torch_lbfgs
+Solver backends: jax (default, CPU/GPU auto), scipy
 Feed bases:      LINEAR (XX/XY/YX/YY), CIRCULAR (RR/RL/LR/LL)
 
 Developed by Arpan Pal 2026, NRAO / NCRA
@@ -22,4 +22,4 @@ __version__ = "1.0.0"
 __author__ = "Arpan Pal"
 
 JONES_TYPES = ("K", "G", "D", "KC", "CP")
-SOLVER_BACKENDS = ("jax_scipy", "torch_lbfgs")
+SOLVER_BACKENDS = ("jax", "scipy")

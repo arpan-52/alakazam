@@ -6,6 +6,8 @@ Returns:  (n_ant, 2, 2).
 Initial guess: cross/parallel ratio from corrected data.
 Ref ant: d_pq[ref] = 0, d_qp[ref] FREE.
 
+Feed-basis aware: uses appropriate initial guess for LINEAR vs CIRCULAR.
+
 Developed by Arpan Pal 2026, NRAO / NCRA
 """
 
@@ -14,9 +16,8 @@ import logging, time as _time
 from typing import Any, Dict, Optional
 import numpy as np
 from scipy.optimize import least_squares
-from . import (JonesSolver, initial_guess_leakage, solve_lbfgsb_jax)
+from . import (JonesSolver, initial_guess_leakage, solve_jax_bfgs)
 from ..jones.constructors import leakage_to_jones
-from ..jones.constructors_ad import leakage_to_jones_np, cost_2x2_np
 from ..jones.algebra import compute_residual_2x2
 
 logger = logging.getLogger("alakazam")
@@ -34,16 +35,19 @@ class LeakageSolver(JonesSolver):
         else:
             obs, model = vis_obs, vis_model
 
-        # Initial guess from data
+        logger.info(f"D solve: feed_basis={self.feed_basis}")
+
+        # Initial guess from data (feed-basis aware)
         d_pq_init, d_qp_init = initial_guess_leakage(
-            obs, model, ant1, ant2, n_ant, self.ref_ant)
+            obs, model, ant1, ant2, n_ant, self.ref_ant,
+            feed_basis=self.feed_basis)
 
         # Pack: [Re(d_pq), Im(d_pq), Re(d_qp), Im(d_qp)]
         x0 = np.concatenate([d_pq_init.real, d_pq_init.imag,
                               d_qp_init.real, d_qp_init.imag])
 
         result = None
-        if self.backend == "jax_scipy":
+        if self.backend == "jax":
             result = self._solve_jax(x0, obs, model, ant1, ant2, n_ant)
         if result is None:
             result = self._solve_scipy_lm(x0, obs, model, ant1, ant2, n_ant)
@@ -52,8 +56,7 @@ class LeakageSolver(JonesSolver):
         d_pq, d_qp = self._unpack(x_opt, n_ant)
         J = leakage_to_jones(d_pq, d_qp)
         wall = _time.time() - t0
-        return {"jones": J, "native_params": {"type": "D", "d_pq": d_pq, "d_qp": d_qp},
-                "converged": conv, "n_iter": n_iter, "cost": cost,
+        return {"jones": J, "converged": conv, "n_iter": n_iter, "cost": cost,
                 "wall_time": wall, "solver_backend": self.backend}
 
     def _unpack(self, x, n_ant):
@@ -88,6 +91,6 @@ class LeakageSolver(JonesSolver):
                 pred = jnp.einsum("bij,bjk,bkl->bil", Ji, model, JjH)
                 d = obs - pred
                 return 0.5 * jnp.sum(d.real**2 + d.imag**2)
-            return solve_lbfgsb_jax(cost, x0, self.max_iter, self.tol)
+            return solve_jax_bfgs(cost, x0, self.max_iter, self.tol)
         except ImportError:
             return None

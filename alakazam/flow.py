@@ -1,16 +1,16 @@
 """ALAKAZAM v1 Pipeline Orchestrator.
 
 Solve flow per cell:
-  LOAD raw (n_row, n_chan, n_corr)    ← native casacore format
-  FLAG raw                            ← on native format
-  AVERAGE raw → tiny (n_bl, n_corr) or (n_bl, n_chan, n_corr)
-  CONVERT tiny to 2x2                ← only here, on averaged data
-  APPLY PARANG at t_mid              ← on tiny 2x2
-  APPLY PREAPPLY at t_mid            ← on tiny 2x2
-  SOLVE                              ← on tiny 2x2
+  LOAD raw (n_row, n_chan, n_corr)    <- native casacore format
+  FLAG raw                            <- on native format
+  AVERAGE raw -> tiny (n_bl, n_corr) or (n_bl, n_chan, n_corr)
+  CONVERT tiny to 2x2                <- only here, on averaged data
+  APPLY PARANG at t_mid              <- on tiny 2x2
+  APPLY PREAPPLY at t_mid            <- on tiny 2x2
+  SOLVE                              <- on tiny 2x2
 
 Memory-aware batching: loads groups of time_bins that fit in RAM.
-Each batch: load → flag → average → free raw → solve → store.
+Each batch: load -> flag -> average -> free raw -> solve -> store.
 
 Developed by Arpan Pal 2026, NRAO / NCRA
 """
@@ -18,7 +18,7 @@ Developed by Arpan Pal 2026, NRAO / NCRA
 from __future__ import annotations
 import gc, json, logging, os, time as _time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 import numpy as np
 
 from .config import (AlakazamConfig, SolveBlock,
@@ -27,15 +27,18 @@ from .core.ms_io import (detect_metadata, read_data, query_times_scans,
                          compute_solint_grid, validate_selections,
                          raw_to_2x2)
 from .core.averaging import (average_per_baseline_full,
-                             average_per_baseline_time_only)
-from .core.rfi import flag_rfi
+                             average_per_baseline_time_only,
+                             _build_bl_map,
+                             accumulate_baselines_freqdep,
+                             accumulate_baselines_full)
 from .core.memory import get_available_ram_gb
 from .core.interpolation import interpolate_jones_multifield
 from .solvers import get_solver, detect_device
 from .io.hdf5 import save_solutions, load_all_fields
 from .calibration.fluxscale import run_fluxscale
 from .calibration.apply import apply_calibration
-from .jones.algebra import compose_jones_chain, unapply_jones_to_rows
+from .jones.algebra import (compose_jones_chain, unapply_jones_to_rows,
+                            detect_feed_basis, FeedBasis)
 
 logger = logging.getLogger("alakazam")
 
@@ -92,26 +95,31 @@ def _run_solve_block(sb: SolveBlock) -> None:
     ant_remap = {orig: new for new, orig in enumerate(active_ants)}
 
     if n_active < meta.n_ant:
-        _log(f"  active: {n_active}/{meta.n_ant} ({', '.join(active_names)})")
+        _log(f"  Antennas: {n_active}/{meta.n_ant} active ({', '.join(active_names)})")
     else:
-        _log(f"  antennas: {n_active}")
+        _log(f"  Antennas: {n_active}")
 
     if sb.ref_ant not in ant_remap:
         raise ValueError(
             f"ref_ant {meta.ant_names[sb.ref_ant]} has no data. "
             f"Active: {active_names}")
     ref_remapped = ant_remap[sb.ref_ant]
-    _log(f"  ref_ant: {meta.ant_names[sb.ref_ant]} (idx {ref_remapped}/{n_active})")
+    _log(f"  Reference antenna: {meta.ant_names[sb.ref_ant]} (index {ref_remapped})")
 
     device = detect_device(sb.solver_backend, sb.gpu)
-    _log(f"  backend={sb.solver_backend} device={device}")
+    _log(f"  Backend: {sb.solver_backend}  Device: {device}")
+
+    # Detect feed basis once for the whole solve block
+    feed_basis = detect_feed_basis(sb.ms)
+    _log(f"  Feed basis: {feed_basis.value}")
 
     global_spws = spw_ids_from_selection(sb.spw)
     if global_spws is None: global_spws = list(range(meta.n_spw))
 
     for spw in global_spws:
         freqs_full = meta.spw_freqs[spw]
-        _log(f"  SPW {spw} ({len(freqs_full)} ch)")
+        _log(f"\n  SPW {spw}: {len(freqs_full)} channels, "
+             f"{freqs_full[0]/1e6:.1f}–{freqs_full[-1]/1e6:.1f} MHz")
         internal_stack: Dict[str, Dict] = {}
 
         # Build unique keys: K0, G0, G1, G2, D0, ...
@@ -136,15 +144,35 @@ def _run_solve_block(sb: SolveBlock) -> None:
             solver = get_solver(
                 jones_type, ref_ant=ref_remapped, max_iter=sb.max_iter,
                 tol=sb.tol, phase_only=sb.phase_only[step_idx],
-                backend=sb.solver_backend, device=device)
+                backend=sb.solver_backend, device=device,
+                feed_basis=feed_basis.value)
+
+            # Format solint for display
+            _solint = sb.time_interval[step_idx]
+            if _solint == -1.0:
+                _solint_str = "per-scan"
+            elif not np.isfinite(_solint):
+                _solint_str = "inf"
+            elif _solint >= 60:
+                _solint_str = f"{_solint/60:.1f}min"
+            else:
+                _solint_str = f"{_solint:.0f}s"
+            _freqint = sb.freq_interval[step_idx]
+            _freqint_str = "full" if _freqint is None else f"{_freqint/1e6:.1f}MHz"
+            _po_str = " (phase-only)" if sb.phase_only[step_idx] else ""
+
+            _log(f"\n    Step {step_idx+1}/{len(sb.jones)}: "
+                 f"Solving {jones_key} — solint={_solint_str} freqint={_freqint_str}{_po_str}",
+                 "bold")
 
             for fi, fn in enumerate(sb.field_groups[step_idx]):
                 fscans = sb.scans_per_step[step_idx][fi] if fi < len(sb.scans_per_step[step_idx]) else None
-                _log(f"    step {step_idx+1} {jones_key} field={fn}")
+                _scan_str = f" scans={fscans}" if fscans else ""
+                _log(f"      Field: {fn}{_scan_str}")
                 _solve_one_field(sb, step_idx, jones_key, fn, fscans,
                                  spw, freqs, chan_sl, meta, solver,
                                  internal_stack, n_active, ant_remap,
-                                 active_names, jones_keys)
+                                 active_names, jones_keys, feed_basis)
 
             fields = load_all_fields(sb.output, jones_key, spw)
             if jones_key not in internal_stack: internal_stack[jones_key] = {}
@@ -158,8 +186,9 @@ def _run_solve_block(sb: SolveBlock) -> None:
 
 def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
                      spw, freqs, chan_sl, meta, solver, internal_stack,
-                     n_active, ant_remap, active_names, jones_keys):
-    """Load raw → flag → average → convert 2x2 → parang/preapply at t_mid → solve.
+                     n_active, ant_remap, active_names, jones_keys,
+                     feed_basis):
+    """Load raw -> flag -> average -> convert 2x2 -> parang/preapply at t_mid -> solve.
     jones_type is the unique key (K0, G0, G1, etc)."""
     n_ant = n_active
     n_chan = len(freqs)
@@ -170,7 +199,7 @@ def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
     # ---- 0. LIGHTWEIGHT QUERY for timestamps ----
     ts = query_times_scans(sb.ms, spw, fields=[field_name], scans=field_scans)
     if not ts:
-        logger.warning(f"      no data for {field_name} spw={spw}"); return
+        _log(f"        No data for {field_name} spw={spw} — skipping"); return
 
     row_times_all = ts["times"]
     row_scans_all = ts["scans"]
@@ -184,7 +213,7 @@ def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
     n_freq = len(freq_bins)
 
     if n_time == 0: return
-    _log(f"      grid: {n_freq}f x {n_time}t = {n_freq*n_time} cells ({total_rows} rows)")
+    _log(f"        Solve grid: {n_freq} freq x {n_time} time = {n_freq*n_time} cells  ({total_rows} rows)")
 
     # ---- 2. MEMORY STRATEGY ----
     bytes_per_row = n_chan * meta.n_corr * 33  # obs(c128) + model(c128) + flags(bool)
@@ -193,10 +222,8 @@ def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
     avail_bytes = max(avail_bytes, 100 * 1024**2)
     max_rows_per_load = max(1, avail_bytes // bytes_per_row)
 
-    rows_per_tbin = []
-    for tb in time_bins:
-        ts_set = set(tb.tolist())
-        rows_per_tbin.append(sum(1 for t in row_times_all if t in ts_set))
+    # Vectorized rows_per_tbin using searchsorted + bincount
+    rows_per_tbin = _compute_rows_per_tbin(row_times_all, time_bins)
 
     total_data_bytes = sum(rows_per_tbin) * bytes_per_row
     max_tbin_bytes = max(rows_per_tbin) * bytes_per_row if rows_per_tbin else 0
@@ -208,22 +235,20 @@ def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
     else:
         tier = 3
 
-    _log(f"      memory: Tier {tier}, budget {avail_bytes/1e9:.1f} GB, "
-         f"data {total_data_bytes/1e9:.2f} GB, "
-         f"max_tbin {max_tbin_bytes/1e9:.2f} GB")
+    _log(f"        Memory strategy: Tier {tier}  "
+         f"(budget {avail_bytes/1e9:.1f} GB, data {total_data_bytes/1e9:.2f} GB)")
 
     # ---- 3. PRECOMPUTE PREAPPLY at t_mid (tiny) ----
     time_centres = np.array([float(np.mean(tb)) for tb in time_bins])
     preapply_at_tmid = _compute_preapply_at_tmids(
         sb, step_idx, field_name, spw, freqs, time_centres, meta, internal_stack,
-        jones_keys=jones_keys)
+        jones_keys=jones_keys, feed_basis=feed_basis)
 
     # ---- 4. ALLOCATE OUTPUT ----
     jones_grid = np.full((n_ant, n_freq, n_time, 2, 2), np.nan+0j, dtype=np.complex128)
     conv_grid = np.zeros((n_freq, n_time), dtype=bool)
     niter_grid = np.zeros((n_freq, n_time), dtype=np.int32)
     cost_grid = np.zeros((n_freq, n_time), dtype=np.float64)
-    native_cells: Dict[Tuple[int, int], Dict] = {}
     freq_centres = np.array([float(np.mean(fb)) for fb in freq_bins])
     n_workers = sb.n_workers if sb.n_workers > 0 else max(
         1, min(os.cpu_count() - 1, n_freq * n_time))
@@ -237,7 +262,7 @@ def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
 
         if nr * bytes_per_row <= avail_bytes:
             # ---- TIER 1/2: one time_bin fits in one read ----
-            _log(f"      [{ti+1}/{n_time}] {nr} rows ({nr*bytes_per_row/1e9:.2f} GB) — single read")
+            logger.debug(f"        tbin [{ti+1}/{n_time}] {nr} rows — single read")
             d = read_data(sb.ms, spw, fields=[field_name], scans=field_scans,
                           data_col=sb.data_col, model_col=sb.model_col,
                           chan_slice=chan_sl, time_range=(t_lo, t_hi))
@@ -248,13 +273,11 @@ def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
             del d
 
             # Flag
-            _log(f"        flagging...")
             vis_r[fl_r] = 0.0; mod_r[fl_r] = 0.0
             fl_r = flag_rfi_raw(vis_r, fl_r, sb.rfi_threshold)
             vis_r[fl_r] = 0.0; mod_r[fl_r] = 0.0
 
             # Average + build cells
-            _log(f"        averaging {n_freq} freq bin(s)...")
             tasks = _build_cells_from_raw(
                 vis_r, mod_r, fl_r, a1r, a2r,
                 freq_bins, freq_idx_bins, freq_dep, n_ant, ti, preapply_at_tmid)
@@ -262,8 +285,9 @@ def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
 
         else:
             # ---- TIER 3: chunk within this time_bin (running accumulator) ----
-            _log(f"      [{ti+1}/{n_time}] {nr} rows ({nr*bytes_per_row/1e9:.2f} GB) — chunked reads")
+            logger.debug(f"        tbin [{ti+1}/{n_time}] {nr} rows — chunked reads")
             n_bl = n_ant * (n_ant - 1) // 2
+            bl_map, oa1, oa2, _ = _build_bl_map(n_ant)
             accum = {}
             for fi in range(n_freq):
                 nc_bin = len(freq_idx_bins[fi])
@@ -271,7 +295,7 @@ def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
                 accum[fi] = {"sum_v": np.zeros(sh, np.complex128),
                              "sum_m": np.zeros(sh, np.complex128),
                              "count": np.zeros(sh, np.float64),
-                             "bl_a1": None, "bl_a2": None}
+                             "bl_a1": oa1, "bl_a2": oa2}
 
             unique_t = np.sort(np.unique(tb))
             ci = 0
@@ -297,17 +321,24 @@ def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
                     fr = flag_rfi_raw(vr, fr, sb.rfi_threshold)
                     vr[fr] = 0.0; mr[fr] = 0.0
                     for fi, (_, f_idx) in enumerate(zip(freq_bins, freq_idx_bins)):
-                        _accumulate_baselines(
-                            vr[:, f_idx, :], mr[:, f_idx, :], fr[:, f_idx, :],
-                            a1r, a2r, n_ant, freq_dep, accum[fi])
+                        ac = accum[fi]
+                        if freq_dep:
+                            accumulate_baselines_freqdep(
+                                vr[:, f_idx, :], mr[:, f_idx, :], fr[:, f_idx, :],
+                                a1r, a2r, n_ant,
+                                ac["sum_v"], ac["sum_m"], ac["count"], bl_map)
+                        else:
+                            accumulate_baselines_full(
+                                vr[:, f_idx, :], mr[:, f_idx, :], fr[:, f_idx, :],
+                                a1r, a2r, n_ant,
+                                ac["sum_v"], ac["sum_m"], ac["count"], bl_map)
                     del vr, mr, fr, a1r, a2r; gc.collect()
                 ci = ce
 
-            # Finalize accumulators → cells
+            # Finalize accumulators -> cells
             tasks = []
             for fi in range(n_freq):
                 ac = accum[fi]
-                if ac["bl_a1"] is None: continue
                 mask = ac["count"] > 0
                 avg_v = np.where(mask, ac["sum_v"] / np.where(mask, ac["count"], 1), 0)
                 avg_m = np.where(mask, ac["sum_m"] / np.where(mask, ac["count"], 1), 0)
@@ -322,12 +353,11 @@ def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
 
         # SOLVE
         _solve_tasks(tasks, solver, n_ant, n_workers,
-                     jones_grid, conv_grid, niter_grid, cost_grid, native_cells)
+                     jones_grid, conv_grid, niter_grid, cost_grid)
         del tasks; gc.collect()
 
-    # ---- 6. FLAG + SAVE ----
+    # ---- 6. FLAG + SAVE (per scan) ----
     sol_flags = _flag_solutions(jones_grid)
-    native_save = _build_native_save(native_cells, jones_type, n_freq, n_time, n_ant)
 
     fid = meta.field_names.index(field_name) if field_name in meta.field_names else 0
     meta_dict = {
@@ -342,24 +372,50 @@ def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
         "ms": sb.ms,
         "solver_backend": sb.solver_backend,
         "apply_parang": sb.apply_parang,
-        "scan_ids": json.dumps(field_scans or []),
         "preapply_chain": json.dumps(_describe_preapply(sb, step_idx)),
-        "n_cells_total": n_freq * n_time,
-        "n_cells_converged": int(conv_grid.sum()),
-        "n_batches": n_time,  # one read per time_bin
+        "feed_basis": feed_basis.value,
     }
 
-    save_solutions(
-        path=sb.output, jones_type=jones_type, field_name=field_name, spw=spw,
-        jones=jones_grid, flags=sol_flags, times=time_centres, freqs=freq_centres,
-        solver_stats={"converged": conv_grid, "n_iter": niter_grid, "cost": cost_grid},
-        meta=meta_dict, native_params=native_save,
-        provenance={"ms": sb.ms, "jones_chain": sb.jones, "step_idx": step_idx,
-                     "field": field_name, "ref_ant": sb.ref_ant,
-                     "preapply_chain": _describe_preapply(sb, step_idx)})
+    # Map each time_bin to its scan_id
+    t2scan = {}
+    for t, s in zip(row_times_all, row_scans_all):
+        t2scan[float(t)] = int(s)
 
-    _log(f"      saved {jones_type}/{field_name}/spw_{spw}  "
-         f"shape={jones_grid.shape} conv={int(conv_grid.sum())}/{conv_grid.size}")
+    from collections import defaultdict
+    scan_groups = defaultdict(list)
+    for ti, tb in enumerate(time_bins):
+        scan_id = t2scan.get(float(tb[0]), 0)
+        scan_groups[scan_id].append(ti)
+
+    for scan_id, t_indices in scan_groups.items():
+        idx = np.array(t_indices)
+        scan_meta = dict(meta_dict)
+        scan_meta["scan_id"] = scan_id
+        scan_meta["n_cells_total"] = n_freq * len(idx)
+        scan_meta["n_cells_converged"] = int(conv_grid[:, idx].sum())
+        save_solutions(
+            path=sb.output, jones_type=jones_type, field_name=field_name,
+            spw=spw, scan_id=scan_id,
+            jones=jones_grid[:, :, idx, :, :],
+            flags=sol_flags[:, :, idx],
+            times=time_centres[idx],
+            freqs=freq_centres,
+            solver_stats={"converged": conv_grid[:, idx],
+                          "n_iter": niter_grid[:, idx],
+                          "cost": cost_grid[:, idx]},
+            meta=scan_meta,
+            provenance={"ms": sb.ms, "jones_chain": sb.jones, "step_idx": step_idx,
+                         "field": field_name, "ref_ant": sb.ref_ant,
+                         "preapply_chain": _describe_preapply(sb, step_idx)})
+
+    n_conv = int(conv_grid.sum())
+    n_total = conv_grid.size
+    n_flag = int(sol_flags.sum())
+    scans_str = ",".join(str(s) for s in sorted(scan_groups.keys()))
+    _log(f"        Flagged {n_flag}/{sol_flags.size} solution slots")
+    _log(f"        Solved {n_conv}/{n_total} cells converged")
+    _log(f"        Saved {jones_type}/{field_name}/scan_[{scans_str}]/spw_{spw} -> {sb.output}  "
+         f"({n_ant} ant x {n_freq} freq x {n_time} time)")
 
 
 # ============================================================
@@ -367,7 +423,7 @@ def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
 # ============================================================
 
 def _solve_tasks(tasks, solver, n_ant, n_workers,
-                 jones_grid, conv_grid, niter_grid, cost_grid, native_cells):
+                 jones_grid, conv_grid, niter_grid, cost_grid):
     """Dispatch tasks to solver, fill grids."""
     import time as _t
 
@@ -378,10 +434,10 @@ def _solve_tasks(tasks, solver, n_ant, n_workers,
             ant1=task["a1"], ant2=task["a2"],
             freqs=task["freqs"], n_ant=n_ant)
         dt = _t.time() - t0
-        logger.info(f"        cell ({task['fi']},{task['ti']}): "
-                     f"{'OK' if r.get('converged') else 'FAIL'} "
-                     f"iter={r.get('n_iter',0)} cost={r.get('cost',0):.2e} "
-                     f"{dt:.1f}s")
+        status = "converged" if r.get('converged') else "FAILED"
+        logger.debug(f"          cell ({task['fi']},{task['ti']}): "
+                     f"{status}  iter={r.get('n_iter',0)} "
+                     f"cost={r.get('cost',0):.2e}  {dt:.1f}s")
         return r
 
     def _store(fi, ti, r):
@@ -389,10 +445,9 @@ def _solve_tasks(tasks, solver, n_ant, n_workers,
         conv_grid[fi, ti] = r.get("converged", False)
         niter_grid[fi, ti] = r.get("n_iter", 0)
         cost_grid[fi, ti] = r.get("cost", 0.0)
-        native_cells[(fi, ti)] = r.get("native_params")
 
     n_tasks = len(tasks)
-    logger.info(f"      solving {n_tasks} cell(s) with {n_workers} worker(s)...")
+    _log(f"        Solving {n_tasks} cell(s)...")
 
     if n_workers > 1 and n_tasks > 1:
         with ThreadPoolExecutor(max_workers=n_workers) as pool:
@@ -409,15 +464,15 @@ def _solve_tasks(tasks, solver, n_ant, n_workers,
 
 def _unapply_on_averaged(J_pre, avg_vis, bl_a1, bl_a2):
     """Correct averaged data: V_corr = J_i^{-1} V J_j^{-H}.
-    
+
     J_pre and avg_vis must have matching dimensions.
     J: (n_ant, 2, 2) for freq-averaged cells
     vis: (n_bl, 2, 2) or (n_bl, n_chan, 2, 2)
-    
+
     For freq-averaged vis (n_bl, 2, 2), add dummy chan dim for numba kernel.
     """
     if avg_vis.ndim == 3:
-        # (n_bl, 2, 2) → add dummy chan → (n_bl, 1, 2, 2)
+        # (n_bl, 2, 2) -> add dummy chan -> (n_bl, 1, 2, 2)
         out = unapply_jones_to_rows(
             J_pre, avg_vis[:, None, :, :], bl_a1, bl_a2)
         return out[:, 0]  # back to (n_bl, 2, 2)
@@ -458,44 +513,38 @@ def _build_cells_from_raw(vis_raw, mod_raw, fl_raw, a1r, a2r,
     return tasks
 
 
-def _accumulate_baselines(vf, mf, ff, ant1, ant2, n_ant, freq_dep, accum):
-    """Accumulate per-baseline sums for running average (Tier 3).
-    vf/mf/ff: (n_row, n_chan_bin, n_corr) or (n_row, n_corr).
-    accum: dict with sum_v, sum_m, count, bl_a1, bl_a2."""
-    from .core.averaging import _build_bl_map
-    bl_map, oa1, oa2, n_bl = _build_bl_map(n_ant)
+def _compute_rows_per_tbin(row_times_all, time_bins):
+    """Vectorized rows-per-tbin using searchsorted + bincount."""
+    if not time_bins:
+        return []
+    # Build a flat array of all unique bin times and map each to a bin index
+    all_unique = np.unique(row_times_all)
+    # For each unique time, find which bin it belongs to
+    bin_edges = []
+    for tb in time_bins:
+        bin_edges.append((tb.min(), tb.max()))
 
-    if accum["bl_a1"] is None:
-        accum["bl_a1"] = oa1
-        accum["bl_a2"] = oa2
+    # Simple approach: map each row time to its bin
+    n_bins = len(time_bins)
+    # Build set lookup for each bin
+    bin_sets = [set(tb.tolist()) for tb in time_bins]
 
-    nr = vf.shape[0]
-    for r in range(nr):
-        a1, a2 = int(ant1[r]), int(ant2[r])
-        if a1 >= a2: continue
-        bl = bl_map[a1, a2]
-        if bl < 0: continue
-        if freq_dep:
-            # vf: (n_row, n_chan, n_corr)
-            for c in range(vf.shape[1]):
-                for p in range(vf.shape[2]):
-                    if not ff[r, c, p]:
-                        accum["sum_v"][bl, c, p] += vf[r, c, p]
-                        accum["sum_m"][bl, c, p] += mf[r, c, p]
-                        accum["count"][bl, c, p] += 1.0
-        else:
-            # vf: (n_row, n_chan, n_corr) but we want full average
-            for c in range(vf.shape[1]):
-                for p in range(vf.shape[2]):
-                    if not ff[r, c, p]:
-                        accum["sum_v"][bl, p] += vf[r, c, p]
-                        accum["sum_m"][bl, p] += mf[r, c, p]
-                        accum["count"][bl, p] += 1.0
+    # Build a mapping: unique_time -> bin_index
+    time_to_bin = {}
+    for bi, ts_set in enumerate(bin_sets):
+        for t in ts_set:
+            time_to_bin[t] = bi
+
+    # Vectorized: map row times to bin indices using the dict
+    bin_idx = np.array([time_to_bin.get(t, -1) for t in row_times_all], dtype=np.int64)
+    valid = bin_idx >= 0
+    counts = np.bincount(bin_idx[valid], minlength=n_bins)
+    return counts.tolist()
 
 
 def _compute_preapply_at_tmids(sb, step_idx, field_name, spw, freqs,
                                 time_centres, meta, internal_stack,
-                                jones_keys=None):
+                                jones_keys=None, feed_basis=None):
     """Compute composed preapply Jones at each t_mid.
     Returns list of (n_ant, 2, 2) or None per time_bin."""
     # No preapply needed for step 0 without parang or external
@@ -508,9 +557,13 @@ def _compute_preapply_at_tmids(sb, step_idx, field_name, spw, freqs,
 
     parts = []
     if has_parang: parts.append("parang")
-    if has_external: parts.append(f"external({len(sb.external_preapply.jones)})")
-    if has_internal: parts.append(f"internal({step_idx} prior steps)")
-    _log(f"      preapply: {' + '.join(parts)} at t_mid")
+    if has_external:
+        ext_jones = ", ".join(sb.external_preapply.jones)
+        parts.append(f"external [{ext_jones}]")
+    if has_internal:
+        prior = ", ".join(jones_keys[:step_idx]) if jones_keys else str(step_idx)
+        parts.append(f"prior [{prior}]")
+    _log(f"        Applying preapply chain: {' + '.join(parts)}")
 
     fid = meta.field_names.index(field_name) if field_name in meta.field_names else 0
     tgt_ra = meta.field_ra[fid]
@@ -524,8 +577,7 @@ def _compute_preapply_at_tmids(sb, step_idx, field_name, spw, freqs,
         if has_parang:
             try:
                 from .jones.parang import compute_parallactic_angles, parang_to_jones
-                from .jones.algebra import detect_feed_basis
-                fb = detect_feed_basis(sb.ms)
+                fb = feed_basis if feed_basis is not None else detect_feed_basis(sb.ms)
                 pa = compute_parallactic_angles(
                     sb.ms, np.array([t_mid]), field=field_name)
                 P = parang_to_jones(pa[0], fb)
@@ -548,7 +600,7 @@ def _compute_preapply_at_tmids(sb, step_idx, field_name, spw, freqs,
                         target_ra=tgt_ra, target_dec=tgt_dec, pinned_fields=epf)
                     if J is not None and J.ndim >= 3:
                         Jt = J[0]  # (n_ant, [n_f,] 2, 2)
-                        # Collapse freq if present → always (n_ant, 2, 2)
+                        # Collapse freq if present -> always (n_ant, 2, 2)
                         if Jt.ndim == 4:
                             Jt = Jt.mean(axis=1)
                         jones_list.append(Jt)
@@ -585,18 +637,13 @@ def _compute_preapply_at_tmids(sb, step_idx, field_name, spw, freqs,
 
 
 def _flag_solutions(jones):
-    """flags.shape = jones.shape[:-2]"""
+    """Vectorized solution flagging. flags.shape = jones.shape[:-2]"""
     fshape = jones.shape[:-2]
     flat = jones.reshape(-1, 2, 2)
-    fl = np.zeros(flat.shape[0], dtype=bool)
-    for i in range(flat.shape[0]):
-        J = flat[i]
-        if np.any(np.isnan(J)) or np.any(np.isinf(J)):
-            fl[i] = True
-        elif np.abs(J[0, 0]*J[1, 1] - J[0, 1]*J[1, 0]) < 1e-20:
-            fl[i] = True
+    has_bad = np.any(np.isnan(flat) | np.isinf(flat), axis=(-2, -1))
+    det = np.abs(flat[..., 0, 0] * flat[..., 1, 1] - flat[..., 0, 1] * flat[..., 1, 0])
+    fl = has_bad | (det < 1e-20)
     n = fl.sum()
-    if n: logger.info(f"      flagged {n}/{fl.size} slots")
     return fl.reshape(fshape)
 
 
@@ -616,54 +663,14 @@ def _compute_freq_grid(freqs, freq_int_hz):
     return blocks, idx_blocks
 
 
-def _build_native_save(cells, jtype, nf, nt, na):
-    if not cells: return None
-    first = next((v for v in cells.values() if v), None)
-    if not first: return None
-    tp = first.get("type", jtype)
-    r = {"type": tp}
-    if tp == "K" and "delay" in first:
-        a = np.zeros((na, nf, nt, 2), dtype=np.float64)
-        for (fi, ti), d in cells.items():
-            if d and "delay" in d: a[:, fi, ti, :] = d["delay"]
-        r["delay"] = a
-    elif tp == "G":
-        amp = np.ones((na, nf, nt, 2)); ph = np.zeros((na, nf, nt, 2))
-        for (fi, ti), d in cells.items():
-            if d:
-                if "amp" in d: amp[:, fi, ti, :] = d["amp"]
-                if "phase" in d: ph[:, fi, ti, :] = d["phase"]
-        r["amp"] = amp; r["phase"] = ph
-    elif tp == "D":
-        dpq = np.zeros((na, nf, nt), dtype=np.complex128)
-        dqp = np.zeros((na, nf, nt), dtype=np.complex128)
-        for (fi, ti), d in cells.items():
-            if d:
-                if "d_pq" in d: dpq[:, fi, ti] = d["d_pq"]
-                if "d_qp" in d: dqp[:, fi, ti] = d["d_qp"]
-        r["d_pq"] = dpq; r["d_qp"] = dqp
-    elif tp == "KC":
-        a = np.zeros((nf, nt))
-        for (fi, ti), d in cells.items():
-            if d and "tau_cross" in d: a[fi, ti] = d["tau_cross"]
-        r["tau_cross"] = a
-    elif tp == "CP":
-        a = np.zeros((nf, nt))
-        for (fi, ti), d in cells.items():
-            if d and "phi_cross" in d: a[fi, ti] = d["phi_cross"]
-        r["phi_cross"] = a
-    return r
 
 
 def _fmt_fields(fields_data, jones_type):
     out = {}
     for fn, sol in fields_data.items():
-        native = sol.get("native_params") or {}
-        if native and "type" not in native: native["type"] = jones_type
         out[fn] = {"times": sol["time"], "freqs": sol.get("freq"),
                     "jones": sol["jones"], "ra_rad": sol.get("ra_rad", 0),
-                    "dec_rad": sol.get("dec_rad", 0),
-                    "native_params": native or None}
+                    "dec_rad": sol.get("dec_rad", 0)}
     return out
 
 

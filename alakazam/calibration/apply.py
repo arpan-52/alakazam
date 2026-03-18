@@ -43,6 +43,12 @@ def apply_calibration(ab: ApplyBlock) -> None:
 
     feed_basis = detect_feed_basis(ab.ms) if ab.apply_parang else None
 
+    jones_names = [t.jones for t in ab.terms]
+    logger.info(f"  Jones chain: {' -> '.join(jones_names)}")
+    if ab.apply_parang:
+        logger.info(f"  Parallactic angle correction: ON ({feed_basis.value if feed_basis else '?'})")
+    logger.info(f"  Output column: {ab.output_col}")
+
     for spw in spws:
         freqs_full = meta.spw_freqs[spw]
         chan_sl = chan_slice_for_spw(ab.spw, spw, len(freqs_full))
@@ -50,7 +56,7 @@ def apply_calibration(ab: ApplyBlock) -> None:
 
         for fid in tgt_fids:
             fname = meta.field_names[fid]
-            logger.info(f"  apply: SPW {spw} field={fname}")
+            logger.info(f"  Applying: SPW {spw}  field={fname}")
 
             d = read_data(ab.ms, spw, fields=[fname], scans=ab.target_scans,
                           data_col="DATA", model_col="MODEL_DATA",
@@ -127,11 +133,12 @@ def apply_calibration(ab: ApplyBlock) -> None:
 
             if flag_arr is not None and np.any(flag_arr):
                 write_flags(ab.ms, row_ids, flag_arr)
-                logger.info(f"  propagated {flag_arr.sum()} flags")
+                logger.info(f"    Propagated {int(flag_arr.sum())} flags to MS")
 
-            logger.info(f"  written {ab.output_col} SPW {spw} {fname}")
+            logger.info(f"    Written {ab.output_col} for {fname} SPW {spw} "
+                        f"({len(row_ids)} rows)")
 
-    logger.info(f"apply: done in {_time.time()-t0:.1f}s")
+    logger.info(f"  Apply complete in {_time.time()-t0:.1f}s")
 
 
 def _load_term(term, spw, meta, target_fname):
@@ -139,13 +146,9 @@ def _load_term(term, spw, meta, target_fname):
     if not raw: return {}
     out = {}
     for fn, sol in raw.items():
-        native = sol.get("native_params") or {}
-        if native and "type" not in native:
-            native["type"] = term.jones
         out[fn] = {
             "times": sol["time"], "freqs": sol.get("freq"),
             "jones": sol["jones"], "ra_rad": sol.get("ra_rad", 0.0),
             "dec_rad": sol.get("dec_rad", 0.0),
-            "native_params": native if native else None,
         }
     return out

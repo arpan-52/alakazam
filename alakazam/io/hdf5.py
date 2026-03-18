@@ -12,18 +12,14 @@ Universal solution schema:
   n_iter:    (n_freq, n_time) int32
   cost:      (n_freq, n_time) float64
 
-  Metadata attrs per solution group:
-    jones_type, field_name, field_ra, field_dec, spw, n_ant,
-    matrix_form, ref_ant_constraint, ref_ant,
-    solint_s, freqint_hz, phase_only, solver_backend,
-    ms, scan_ids, preapply_chain
-
-  Native params:
-    K:  delay (n_ant, 2) float64 ns  — per time slot
-    G:  amp (n_ant, 2), phase (n_ant, 2) float64
-    D:  d_pq (n_ant,) complex128, d_qp (n_ant,) complex128
-    KC: tau_cross float64 ns
-    CP: phi_cross float64 rad
+  Hierarchy:
+    {jones_key}/field_{name}/scan_{id}/spw_{n}/
+      jones, flags, time, freq, solver_stats/
+      attrs: jones_type, field_name, scan_id, spw, n_ant,
+             field_ra, field_dec, matrix_form, ref_ant_constraint,
+             ref_ant, ref_ant_name, ant_names, solint_s, freqint_hz,
+             phase_only, feed_basis, solver_backend, apply_parang,
+             ms, preapply_chain
 
 Developed by Arpan Pal 2026, NRAO / NCRA
 """
@@ -55,6 +51,7 @@ REF_ANT_CONSTRAINTS = {
 
 
 def _fk(name): return f"field_{name.replace(' ', '_')}"
+def _sck(scan_id): return f"scan_{scan_id}"
 def _sk(spw): return f"spw_{spw}"
 def _exists(p): return os.path.exists(p)
 
@@ -67,10 +64,10 @@ def save_solutions(
     freqs: np.ndarray,          # (n_freq,) Hz
     solver_stats: Dict,         # {converged, n_iter, cost} each (n_freq, n_time)
     meta: Dict[str, Any],
-    native_params: Optional[Dict] = None,
+    scan_id: int = 0,
     provenance: Optional[Dict] = None,
 ) -> None:
-    """Write solutions in universal schema."""
+    """Write solutions in universal schema with scan-level hierarchy."""
     mode = "a" if _exists(path) else "w"
     with h5py.File(path, mode) as f:
         if "version" not in f.attrs:
@@ -83,7 +80,7 @@ def save_solutions(
             for k, v in provenance.items():
                 pg.attrs[k] = json.dumps(v) if isinstance(v, (dict, list)) else str(v)
 
-        jkey = f"{jones_type}/{_fk(field_name)}/{_sk(spw)}"
+        jkey = f"{jones_type}/{_fk(field_name)}/{_sck(scan_id)}/{_sk(spw)}"
         if jkey in f:
             del f[jkey]
         g = f.require_group(jkey)
@@ -102,14 +99,16 @@ def save_solutions(
                     sg.create_dataset(k, data=v)
 
         # Metadata
+        base_type = jones_type.rstrip("0123456789")
         g.attrs["jones_type"] = jones_type
         g.attrs["field_name"] = field_name
+        g.attrs["scan_id"] = scan_id
         g.attrs["spw"] = spw
         g.attrs["n_ant"] = jones.shape[0]
         g.attrs["n_freq"] = jones.shape[1]
         g.attrs["n_time"] = jones.shape[2]
-        g.attrs["matrix_form"] = MATRIX_FORMS.get(jones_type, "unknown")
-        g.attrs["ref_ant_constraint"] = REF_ANT_CONSTRAINTS.get(jones_type, "unknown")
+        g.attrs["matrix_form"] = MATRIX_FORMS.get(base_type, "unknown")
+        g.attrs["ref_ant_constraint"] = REF_ANT_CONSTRAINTS.get(base_type, "unknown")
         for k, v in meta.items():
             if isinstance(v, (dict, list)):
                 g.attrs[k] = json.dumps(v)
@@ -118,64 +117,96 @@ def save_solutions(
             elif v is not None:
                 g.attrs[k] = v
 
-        # Native params
-        if native_params:
-            npkey = f"native_params/{jones_type}/{_fk(field_name)}/{_sk(spw)}"
-            if npkey in f:
-                del f[npkey]
-            ng = f.require_group(npkey)
-            for k, v in native_params.items():
-                if isinstance(v, np.ndarray):
-                    ng.create_dataset(k, data=v)
-                elif isinstance(v, (int, float, np.integer, np.floating)):
-                    ng.attrs[k] = float(v) if isinstance(v, (float, np.floating)) else int(v)
-                elif isinstance(v, complex):
-                    ng.attrs[k + "_re"] = v.real
-                    ng.attrs[k + "_im"] = v.imag
-                elif isinstance(v, str):
-                    ng.attrs[k] = v
-
 
 def load_solutions(path: str, jones_type: str,
-                   field_name: str, spw: int) -> Dict[str, Any]:
-    """Load one solution.  Returns dict with jones, flags, time, freq, attrs, native_params."""
+                   field_name: str, spw: int,
+                   scan_id: Optional[int] = None) -> Dict[str, Any]:
+    """Load solutions.  If scan_id given, load one scan; otherwise concatenate all scans."""
     with h5py.File(path, "r") as f:
-        key = f"{jones_type}/{_fk(field_name)}/{_sk(spw)}"
-        if key not in f:
-            raise KeyError(f"Not found: {key} in {path}")
-        g = f[key]
-        jones = g["jones"][:]
-        flags = g["flags"][:] if "flags" in g else None
-        times = g["time"][:]
-        freqs = g["freq"][:] if "freq" in g else None
-        attrs = dict(g.attrs)
+        fk = _fk(field_name)
+        sk = _sk(spw)
 
-        # Solver stats
+        if scan_id is not None:
+            # Load a single scan
+            key = f"{jones_type}/{fk}/{_sck(scan_id)}/{sk}"
+            if key not in f:
+                raise KeyError(f"Not found: {key} in {path}")
+            return _load_group(f[key])
+
+        # Try new scan-level hierarchy: concatenate all scans
+        field_key = f"{jones_type}/{fk}"
+        if field_key not in f:
+            # Try legacy flat hierarchy
+            key = f"{jones_type}/{fk}/{sk}"
+            if key not in f:
+                raise KeyError(f"Not found: {field_key} in {path}")
+            return _load_group(f[key])
+
+        fg = f[field_key]
+        scan_keys = sorted([k for k in fg.keys() if k.startswith("scan_")],
+                           key=lambda x: int(x[5:]))
+        if not scan_keys:
+            # Legacy: spw directly under field
+            if sk in fg:
+                return _load_group(fg[sk])
+            raise KeyError(f"No scans or SPWs found under {field_key}")
+
+        # Concatenate across scans
+        parts = []
+        for sck in scan_keys:
+            if sk not in fg[sck]:
+                continue
+            parts.append(_load_group(fg[sck][sk]))
+
+        if not parts:
+            raise KeyError(f"SPW {spw} not found in any scan under {field_key}")
+        if len(parts) == 1:
+            return parts[0]
+
+        # Concatenate along time axis (axis=2 for jones, axis=0 for time)
+        sort_idx = np.argsort(np.concatenate([p["time"] for p in parts]))
+        jones = np.concatenate([p["jones"] for p in parts], axis=2)[:, :, sort_idx]
+        flags = np.concatenate([p["flags"] for p in parts], axis=2)[:, :, sort_idx]
+        times = np.concatenate([p["time"] for p in parts])[sort_idx]
+        freqs = parts[0]["freq"]
+        attrs = parts[0]["attrs"]
+
+        # Merge solver stats
         solver_stats = {}
-        if "solver_stats" in g:
-            for k in g["solver_stats"].keys():
-                solver_stats[k] = g["solver_stats"][k][:]
-
-        # Native params
-        npk = f"native_params/{jones_type}/{_fk(field_name)}/{_sk(spw)}"
-        native = {}
-        if npk in f:
-            ng = f[npk]
-            for k in ng.keys():
-                native[k] = ng[k][:]
-            native.update(dict(ng.attrs))
+        if parts[0]["solver_stats"]:
+            for k in parts[0]["solver_stats"]:
+                solver_stats[k] = np.concatenate(
+                    [p["solver_stats"][k] for p in parts if k in p["solver_stats"]],
+                    axis=1)[:, sort_idx]
 
         ra = float(attrs.get("field_ra", 0.0))
         dec = float(attrs.get("field_dec", 0.0))
+        return {"jones": jones, "flags": flags, "time": times, "freq": freqs,
+                "attrs": attrs, "solver_stats": solver_stats,
+                "ra_rad": ra, "dec_rad": dec}
 
+
+def _load_group(g) -> Dict[str, Any]:
+    """Load datasets from a single solution group."""
+    jones = g["jones"][:]
+    flags = g["flags"][:] if "flags" in g else None
+    times = g["time"][:]
+    freqs = g["freq"][:] if "freq" in g else None
+    attrs = dict(g.attrs)
+    solver_stats = {}
+    if "solver_stats" in g:
+        for k in g["solver_stats"].keys():
+            solver_stats[k] = g["solver_stats"][k][:]
+    ra = float(attrs.get("field_ra", 0.0))
+    dec = float(attrs.get("field_dec", 0.0))
     return {"jones": jones, "flags": flags, "time": times, "freq": freqs,
             "attrs": attrs, "solver_stats": solver_stats,
-            "native_params": native if native else None,
             "ra_rad": ra, "dec_rad": dec}
 
 
 def load_all_fields(path: str, jones_type: str, spw: int,
                     field_names: Optional[List[str]] = None) -> Dict[str, Dict]:
+    """Load all fields for a jones type/spw, concatenating scans."""
     result = {}
     with h5py.File(path, "r") as f:
         if jones_type not in f:
@@ -184,44 +215,54 @@ def load_all_fields(path: str, jones_type: str, spw: int,
         for fkey in jg.keys():
             if not fkey.startswith("field_"):
                 continue
-            sk = _sk(spw)
-            if sk not in jg[fkey]:
-                continue
-            sg = jg[fkey][sk]
-            fname = sg.attrs.get("field_name", fkey[len("field_"):])
+            # Infer field name from first available scan/spw group attrs
+            fname = _infer_field_name(jg[fkey], fkey)
             if field_names is not None and fname not in field_names:
                 continue
-            jones = sg["jones"][:]
-            flags = sg["flags"][:] if "flags" in sg else None
-            times = sg["time"][:]
-            freqs = sg["freq"][:] if "freq" in sg else None
-            attrs = dict(sg.attrs)
-            ra = float(attrs.get("field_ra", 0.0))
-            dec = float(attrs.get("field_dec", 0.0))
-            npk = f"native_params/{jones_type}/{fkey}/{sk}"
-            native = {}
-            if npk in f:
-                ng = f[npk]
-                for k in ng.keys():
-                    native[k] = ng[k][:]
-                native.update(dict(ng.attrs))
-            result[fname] = {
-                "jones": jones, "flags": flags, "time": times, "freq": freqs,
-                "attrs": attrs, "native_params": native if native else None,
-                "ra_rad": ra, "dec_rad": dec,
-            }
+            try:
+                sol = load_solutions(path, jones_type, fname, spw)
+            except KeyError:
+                continue
+            result[fname] = sol
     return result
+
+
+def _infer_field_name(field_group, fkey):
+    """Get field_name from attrs, checking scan subgroups or legacy layout."""
+    for sck in field_group.keys():
+        sg = field_group[sck]
+        if isinstance(sg, h5py.Group):
+            # Check if this is a scan group with spw subgroups
+            for sk in sg.keys():
+                if isinstance(sg[sk], h5py.Group) and "jones" in sg[sk]:
+                    return sg[sk].attrs.get("field_name", fkey[len("field_"):])
+            # Legacy: spw directly under field
+            if "jones" in sg:
+                return sg.attrs.get("field_name", fkey[len("field_"):])
+    return fkey[len("field_"):]
 
 
 def list_jones_types(path):
     with h5py.File(path, "r") as f:
-        return [k for k in f.keys() if k not in ("metadata", "native_params", "fluxscale")]
+        return [k for k in f.keys() if k not in ("metadata", "fluxscale")]
 
 def list_spws(path, jones_type, field_name):
+    """List SPW ids, handling scan-level hierarchy."""
     with h5py.File(path, "r") as f:
         fk = f"{jones_type}/{_fk(field_name)}"
         if fk not in f: return []
-        return [int(k[4:]) for k in f[fk].keys() if k.startswith("spw_")]
+        fg = f[fk]
+        spws = set()
+        for key in fg.keys():
+            if key.startswith("spw_"):
+                # Legacy layout
+                spws.add(int(key[4:]))
+            elif key.startswith("scan_"):
+                # New scan-level layout
+                for sk in fg[key].keys():
+                    if sk.startswith("spw_"):
+                        spws.add(int(sk[4:]))
+        return sorted(spws)
 
 def copy_solutions(src, dst):
     mode = "a" if _exists(dst) else "w"
@@ -231,14 +272,33 @@ def copy_solutions(src, dst):
                 s.copy(k, d)
 
 def rescale_solutions(path, jones_type, field_name, spw, scale_p, scale_q):
+    """Rescale jones solutions across all scans for a field/spw."""
     with h5py.File(path, "a") as f:
-        key = f"{jones_type}/{_fk(field_name)}/{_sk(spw)}/jones"
-        if key not in f:
-            raise KeyError(f"Not found: {key}")
-        j = f[key][:]
-        j[..., 0, 0] *= np.sqrt(scale_p)
-        j[..., 1, 1] *= np.sqrt(scale_q)
-        f[key][...] = j
+        fk = f"{jones_type}/{_fk(field_name)}"
+        if fk not in f:
+            raise KeyError(f"Not found: {fk}")
+        fg = f[fk]
+        rescaled = False
+        for key in fg.keys():
+            if key.startswith("scan_"):
+                sk = _sk(spw)
+                if sk in fg[key] and "jones" in fg[key][sk]:
+                    jpath = f"{fk}/{key}/{sk}/jones"
+                    j = f[jpath][:]
+                    j[..., 0, 0] *= np.sqrt(scale_p)
+                    j[..., 1, 1] *= np.sqrt(scale_q)
+                    f[jpath][...] = j
+                    rescaled = True
+            elif key == _sk(spw) and "jones" in fg[key]:
+                # Legacy layout
+                jpath = f"{fk}/{key}/jones"
+                j = f[jpath][:]
+                j[..., 0, 0] *= np.sqrt(scale_p)
+                j[..., 1, 1] *= np.sqrt(scale_q)
+                f[jpath][...] = j
+                rescaled = True
+        if not rescaled:
+            raise KeyError(f"No jones data found for {fk}/spw_{spw}")
 
 def save_fluxscale(path, transfer_field, spw, scale_p, scale_q,
                    scatter_p, scatter_q, n_ant, reference_field,
@@ -265,13 +325,26 @@ def print_summary(path):
             if jt not in f: continue
             for fkey in f[jt].keys():
                 if not fkey.startswith("field_"): continue
-                for sk in f[jt][fkey].keys():
-                    g = f[jt][fkey][sk]
-                    s = g["jones"].shape
-                    print(f"  [{jt}] {fkey} {sk}  shape={s}  "
-                          f"n_ant={s[0]} n_freq={s[1]} n_time={s[2]}")
-                    print(f"    matrix: {g.attrs.get('matrix_form', '')}")
-                    print(f"    backend: {g.attrs.get('solver_backend', '?')}")
+                fg = f[jt][fkey]
+                for sck in sorted(fg.keys()):
+                    sg = fg[sck]
+                    if sck.startswith("scan_"):
+                        for sk in sorted(sg.keys()):
+                            if not sk.startswith("spw_"): continue
+                            g = sg[sk]
+                            if "jones" not in g: continue
+                            s = g["jones"].shape
+                            print(f"  [{jt}] {fkey} {sck} {sk}  shape={s}  "
+                                  f"n_ant={s[0]} n_freq={s[1]} n_time={s[2]}")
+                            print(f"    matrix: {g.attrs.get('matrix_form', '')}")
+                            print(f"    backend: {g.attrs.get('solver_backend', '?')}")
+                    elif sck.startswith("spw_") and "jones" in sg:
+                        # Legacy layout
+                        s = sg["jones"].shape
+                        print(f"  [{jt}] {fkey} {sck}  shape={s}  "
+                              f"n_ant={s[0]} n_freq={s[1]} n_time={s[2]}")
+                        print(f"    matrix: {sg.attrs.get('matrix_form', '')}")
+                        print(f"    backend: {sg.attrs.get('solver_backend', '?')}")
         if "fluxscale" in f:
             print("  Fluxscale:")
             for fk in f["fluxscale"].keys():
@@ -280,3 +353,25 @@ def print_summary(path):
                     print(f"    {a.get('transfer_field','?')} <- "
                           f"{a.get('reference_field','?')}  "
                           f"scale_p={a.get('scale_p',0):.4f}")
+
+
+def print_fluxscale_summary(path):
+    """Print only fluxscale groups with detailed info."""
+    with h5py.File(path, "r") as f:
+        print(f"\n=== Fluxscale: {path} ===")
+        if "fluxscale" not in f:
+            print("  No fluxscale data found.")
+            return
+        for fk in f["fluxscale"].keys():
+            for sk in f["fluxscale"][fk].keys():
+                a = f["fluxscale"][fk][sk].attrs
+                print(f"\n  Transfer: {a.get('transfer_field', '?')}")
+                print(f"  Reference: {a.get('reference_field', '?')}")
+                print(f"  Reference table: {a.get('reference_table', '?')}")
+                print(f"  Jones type: {a.get('jones_type', '?')}")
+                print(f"  SPW: {sk}")
+                print(f"  Scale p: {a.get('scale_p', 0):.6f}")
+                print(f"  Scale q: {a.get('scale_q', 0):.6f}")
+                print(f"  Scatter p: {a.get('scatter_p', 0):.6f}")
+                print(f"  Scatter q: {a.get('scatter_q', 0):.6f}")
+                print(f"  N antennas: {a.get('n_ant', '?')}")

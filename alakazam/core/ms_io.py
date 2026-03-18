@@ -61,7 +61,7 @@ class MSMetadata:
 
 
 def detect_metadata(ms_path: str) -> MSMetadata:
-    from casacore.tables import table
+    from casacore.tables import table, taql
     with suppress_stderr():
         ant_tab = table(f"{ms_path}::ANTENNA", readonly=True, ack=False)
     ant_names = list(ant_tab.getcol("NAME"))
@@ -86,16 +86,25 @@ def detect_metadata(ms_path: str) -> MSMetadata:
     field_dec = [float(phase_dirs[i, 0, 1]) for i in range(len(field_names))]
     field_tab.close()
 
+    # Lighter metadata: use TaQL DISTINCT to avoid reading full columns
     ms = table(ms_path, readonly=True, ack=False)
-    ant1_col = ms.getcol("ANTENNA1")
-    ant2_col = ms.getcol("ANTENNA2")
-    times_col = ms.getcol("TIME")
-    scans_col = ms.getcol("SCAN_NUMBER")
-    ms.close()
+    try:
+        sub = taql("SELECT DISTINCT ANTENNA1, ANTENNA2 FROM $ms WHERE ANTENNA1 != ANTENNA2")
+        ant1_col = sub.getcol("ANTENNA1")
+        ant2_col = sub.getcol("ANTENNA2")
+        sub.close()
 
-    mask = ant1_col != ant2_col
-    unique_bl = np.unique(
-        np.stack([ant1_col[mask], ant2_col[mask]], axis=1), axis=0)
+        unique_bl = np.stack([ant1_col, ant2_col], axis=1)
+
+        sub_t = taql("SELECT DISTINCT TIME FROM $ms")
+        unique_times = sub_t.getcol("TIME")
+        sub_t.close()
+
+        sub_s = taql("SELECT DISTINCT SCAN_NUMBER FROM $ms")
+        unique_scans = sub_s.getcol("SCAN_NUMBER")
+        sub_s.close()
+    finally:
+        ms.close()
 
     return MSMetadata(
         ms_path=ms_path, n_ant=n_ant, ant_names=ant_names,
@@ -106,7 +115,7 @@ def detect_metadata(ms_path: str) -> MSMetadata:
         n_baseline=len(unique_bl),
         ant1=unique_bl[:, 0].astype(np.int32),
         ant2=unique_bl[:, 1].astype(np.int32),
-        times=np.unique(times_col), scans=scans_col,
+        times=np.sort(unique_times), scans=unique_scans,
     )
 
 
@@ -265,8 +274,24 @@ def flags_to_2x2(fl):
 
 
 # -------------------------------------------------------------------
-# Write
+# Write — batch optimized
 # -------------------------------------------------------------------
+
+def _find_contiguous_chunks(row_ids):
+    """Find contiguous chunks in sorted row_ids for batch putcol."""
+    if len(row_ids) == 0:
+        return []
+    sorted_idx = np.argsort(row_ids)
+    sorted_rids = row_ids[sorted_idx]
+    breaks = np.where(np.diff(sorted_rids) != 1)[0] + 1
+    chunks = []
+    prev = 0
+    for b in breaks:
+        chunks.append((int(sorted_rids[prev]), sorted_idx[prev:b]))
+        prev = b
+    chunks.append((int(sorted_rids[prev]), sorted_idx[prev:]))
+    return chunks
+
 
 def write_corrected(ms_path, row_ids, corrected, output_col="CORRECTED_DATA"):
     """Write corrected (n_row, n_chan, 2, 2) back to MS."""
@@ -284,8 +309,13 @@ def write_corrected(ms_path, row_ids, corrected, output_col="CORRECTED_DATA"):
         desc = ms.getcoldesc("DATA")
         ms.addcols(maketabdesc(makearrcoldesc(
             output_col, 0+0j, ndim=desc.get("ndim", 2), shape=desc.get("shape"))))
-    for i, rid in enumerate(row_ids):
-        ms.putcell(output_col, int(rid), flat[i])
+
+    chunks = _find_contiguous_chunks(np.asarray(row_ids))
+    for startrow, idx in chunks:
+        if len(idx) > 1:
+            ms.putcol(output_col, flat[idx], startrow=startrow, nrow=len(idx))
+        else:
+            ms.putcell(output_col, startrow, flat[idx[0]])
     ms.close()
 
 
@@ -301,9 +331,16 @@ def write_flags(ms_path, row_ids, flags):
     flat[..., 3] = flags[..., 1, 1]
 
     ms = table(ms_path, readonly=False, ack=False)
-    for i, rid in enumerate(row_ids):
-        existing = ms.getcell("FLAG", int(rid))
-        ms.putcell("FLAG", int(rid), existing | flat[i, :, :existing.shape[-1]])
+    chunks = _find_contiguous_chunks(np.asarray(row_ids))
+    for startrow, idx in chunks:
+        if len(idx) > 1:
+            existing = ms.getcol("FLAG", startrow=startrow, nrow=len(idx))
+            nc_exist = existing.shape[-1]
+            ms.putcol("FLAG", existing | flat[idx, :, :nc_exist],
+                      startrow=startrow, nrow=len(idx))
+        else:
+            existing = ms.getcell("FLAG", startrow)
+            ms.putcell("FLAG", startrow, existing | flat[idx[0], :, :existing.shape[-1]])
     ms.close()
 
 

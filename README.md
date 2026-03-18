@@ -156,8 +156,8 @@ The 2×2 matrix conversion only happens on the tiny averaged cell data.
 
 | Backend | Method | GPU |
 |---------|--------|-----|
-| `jax_scipy` | JAX exact gradients + scipy L-BFGS-B | auto |
-| `torch_lbfgs` | PyTorch LBFGS | auto |
+| `jax` | Pure JAX BFGS (JIT-able, auto CPU/GPU) | auto |
+| `scipy` | scipy Levenberg-Marquardt | CPU only |
 
 Falls back to scipy Levenberg-Marquardt if JAX unavailable.
 

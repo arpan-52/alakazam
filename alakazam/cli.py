@@ -64,8 +64,8 @@ def main():
         print_summary(args.h5file)
 
     elif args.command == "fluxscale-info":
-        from .io.hdf5 import print_summary
-        print_summary(args.h5file)
+        from .io.hdf5 import print_fluxscale_summary
+        print_fluxscale_summary(args.h5file)
 
     else:
         parser.print_help()

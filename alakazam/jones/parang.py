@@ -32,6 +32,7 @@ def compute_parallactic_angles(
     from casacore.tables import table
     from casacore.measures import measures
     from casacore.quanta import quantity
+    from ..core.ms_io import suppress_stderr
 
     dm = measures()
 
@@ -46,7 +47,15 @@ def compute_parallactic_angles(
     if field is not None and field in field_names:
         fid = field_names.index(field)
     phase_dir = field_tab.getcol("PHASE_DIR")[fid]
+
+    # Check PHASE_DIR reference frame is J2000
+    measinfo = field_tab.getcolkeyword("PHASE_DIR", "MEASINFO")
+    ref_frame = measinfo.get("Ref", "J2000") if measinfo else "J2000"
     field_tab.close()
+
+    if ref_frame.upper() != "J2000":
+        raise ValueError(
+            f"Only J2000 PHASE_DIR supported. Found: {ref_frame}")
 
     src_dir = dm.direction(
         "J2000",
@@ -57,19 +66,20 @@ def compute_parallactic_angles(
     n_time = len(unique_times)
     parang = np.zeros((n_time, n_ant), dtype=np.float64)
 
-    for t in range(n_time):
-        dm.do_frame(dm.epoch(
-            "UTC", quantity(unique_times[t] / 86400.0, "d")))
-        for a in range(n_ant):
-            pos = dm.position(
-                "ITRF",
-                quantity(ant_pos[a, 0], "m"),
-                quantity(ant_pos[a, 1], "m"),
-                quantity(ant_pos[a, 2], "m"),
-            )
-            dm.do_frame(pos)
-            parang[t, a] = dm.posangle(
-                src_dir, dm.direction("ZENITH")).get_value("rad")
+    with suppress_stderr():
+        for t in range(n_time):
+            dm.do_frame(dm.epoch(
+                "UTC", quantity(unique_times[t] / 86400.0, "d")))
+            for a in range(n_ant):
+                pos = dm.position(
+                    "ITRF",
+                    quantity(ant_pos[a, 0], "m"),
+                    quantity(ant_pos[a, 1], "m"),
+                    quantity(ant_pos[a, 2], "m"),
+                )
+                dm.do_frame(pos)
+                parang[t, a] = dm.posangle(
+                    src_dir, dm.direction("ZENITH")).get_value("rad")
 
     return parang
 
