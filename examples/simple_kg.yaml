@@ -8,7 +8,7 @@ solve:
     ref_ant: C04
     data_col: DATA
     model_col: MODEL_DATA
-    solver_backend: jax_scipy
+    solver_backend: jax
 
     jones: [K, G]
     field: [3C286, 3C286]

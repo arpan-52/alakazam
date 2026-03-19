@@ -11,7 +11,7 @@ solve:
     output: polcal.h5
     ref_ant: 9
     apply_parang: true
-    solver_backend: jax_scipy
+    solver_backend: jax
 
     jones: [K, G, G, D, KC, CP]
 

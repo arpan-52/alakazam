@@ -14,10 +14,8 @@ import logging, time as _time
 from typing import Any, Dict, Optional
 import numpy as np
 from scipy.optimize import least_squares
-from . import (JonesSolver, initial_guess_gain_bfs,
-               solve_lbfgsb_jax)
+from . import (JonesSolver, initial_guess_gain_bfs, solve_jax_bfgs)
 from ..jones.constructors import gains_to_jones
-from ..jones.constructors_ad import gains_to_jones_np, cost_diag_np
 from ..jones.algebra import compute_residual_diag
 
 logger = logging.getLogger("alakazam")
@@ -43,7 +41,7 @@ class GainsSolver(JonesSolver):
             amp_init = np.ones_like(amp_init)
 
         result = None
-        if self.backend == "jax_scipy":
+        if self.backend == "jax":
             result = self._solve_jax(
                 amp_init, phase_init, obs, model, ant1, ant2, n_ant)
         if result is None:
@@ -54,8 +52,7 @@ class GainsSolver(JonesSolver):
         amp, phase = self._unpack(x_opt, n_ant)
         J = gains_to_jones(amp, phase)
         wall = _time.time() - t0
-        return {"jones": J, "native_params": {"type": "G", "amp": amp, "phase": phase},
-                "converged": conv, "n_iter": n_iter, "cost": cost,
+        return {"jones": J, "converged": conv, "n_iter": n_iter, "cost": cost,
                 "wall_time": wall, "solver_backend": self.backend}
 
     def _unpack(self, x, n_ant):
@@ -97,7 +94,7 @@ class GainsSolver(JonesSolver):
                 dp = obs[:,0,0] - gp[a1]*model[:,0,0]*jnp.conj(gp[a2])
                 dq = obs[:,1,1] - gq[a1]*model[:,1,1]*jnp.conj(gq[a2])
                 return 0.5*(jnp.sum(dp.real**2+dp.imag**2)+jnp.sum(dq.real**2+dq.imag**2))
-            return solve_lbfgsb_jax(cost, self._pack(amp_init, phase_init),
+            return solve_jax_bfgs(cost, self._pack(amp_init, phase_init),
                                     self.max_iter, self.tol)
         except ImportError:
             return None

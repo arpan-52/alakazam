@@ -121,8 +121,7 @@ def _interp_time(sol_times, sol_data, target_times, mode):
 # -------------------------------------------------------------------
 
 def interpolate_jones(sol_times, sol_freqs, sol_jones,
-                      target_times, target_freqs, time_interp,
-                      native_params=None):
+                      target_times, target_freqs, time_interp):
     """Interpolate a jones cube onto target time/freq grids.
 
     sol_jones can be:
@@ -179,7 +178,7 @@ def interpolate_jones_multifield(
 ):
     """Select field and interpolate.
 
-    fields_data: {name: {times, freqs, jones, ra_rad, dec_rad, native_params}}
+    fields_data: {name: {times, freqs, jones, ra_rad, dec_rad}}
     Returns: (n_t, n_ant, [n_f,] 2, 2)
     """
     if not fields_data:
@@ -197,8 +196,7 @@ def interpolate_jones_multifield(
                 fd = fields_data[chosen]
                 return interpolate_jones(
                     fd["times"], fd.get("freqs"), fd["jones"],
-                    target_times, target_freqs, time_interp,
-                    native_params=fd.get("native_params"))
+                    target_times, target_freqs, time_interp)
             field_select = "nearest_time"
 
     if field_select == "nearest_time":
@@ -209,16 +207,14 @@ def interpolate_jones_multifield(
             fd = fields_data[ufields[0]]
             return interpolate_jones(
                 fd["times"], fd.get("freqs"), fd["jones"],
-                target_times, target_freqs, time_interp,
-                native_params=fd.get("native_params"))
+                target_times, target_freqs, time_interp)
         result = None
         for fn in ufields:
             mask = fft == fn
             fd = fields_data[fn]
             sub = interpolate_jones(
                 fd["times"], fd.get("freqs"), fd["jones"],
-                target_times[mask], target_freqs, time_interp,
-                native_params=fd.get("native_params"))
+                target_times[mask], target_freqs, time_interp)
             if result is None:
                 result = np.empty((len(target_times),) + sub.shape[1:], dtype=np.complex128)
             result[mask] = sub
@@ -234,8 +230,7 @@ def interpolate_jones_multifield(
             fd = fields_data[fn]
             results.append(interpolate_jones(
                 fd["times"], fd.get("freqs"), fd["jones"],
-                target_times, target_freqs, time_interp,
-                native_params=fd.get("native_params")))
+                target_times, target_freqs, time_interp))
         if len(results) == 1:
             return results[0]
         return np.mean(np.stack(results), axis=0)

@@ -85,3 +85,51 @@ def average_per_baseline_time_only(vis, flags, ant1, ant2, n_ant):
                     avg[bl, c, p] /= wt[bl, c, p]
 
     return avg, oa1, oa2
+
+
+@njit(cache=True)
+def accumulate_baselines_freqdep(vf, mf, ff, ant1, ant2, n_ant,
+                                  sum_v, sum_m, count, bl_map):
+    """Accumulate per-baseline sums for freq-dependent running average (Tier 3).
+    vf/mf: (n_row, n_chan, n_corr), ff: (n_row, n_chan, n_corr) bool.
+    sum_v/sum_m/count: (n_bl, n_chan, n_corr) — mutated in-place."""
+    nr = vf.shape[0]
+    nc = vf.shape[1]
+    np_ = vf.shape[2]
+    for r in range(nr):
+        a1, a2 = ant1[r], ant2[r]
+        if a1 >= a2:
+            continue
+        bl = bl_map[a1, a2]
+        if bl < 0:
+            continue
+        for c in range(nc):
+            for p in range(np_):
+                if not ff[r, c, p]:
+                    sum_v[bl, c, p] += vf[r, c, p]
+                    sum_m[bl, c, p] += mf[r, c, p]
+                    count[bl, c, p] += 1.0
+
+
+@njit(cache=True)
+def accumulate_baselines_full(vf, mf, ff, ant1, ant2, n_ant,
+                               sum_v, sum_m, count, bl_map):
+    """Accumulate per-baseline sums for full (time+freq) running average (Tier 3).
+    vf/mf: (n_row, n_chan, n_corr), ff: (n_row, n_chan, n_corr) bool.
+    sum_v/sum_m/count: (n_bl, n_corr) — mutated in-place."""
+    nr = vf.shape[0]
+    nc = vf.shape[1]
+    np_ = vf.shape[2]
+    for r in range(nr):
+        a1, a2 = ant1[r], ant2[r]
+        if a1 >= a2:
+            continue
+        bl = bl_map[a1, a2]
+        if bl < 0:
+            continue
+        for c in range(nc):
+            for p in range(np_):
+                if not ff[r, c, p]:
+                    sum_v[bl, p] += vf[r, c, p]
+                    sum_m[bl, p] += mf[r, c, p]
+                    count[bl, p] += 1.0

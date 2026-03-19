@@ -9,7 +9,7 @@ SPW syntax (CASA-native):
   0:127~156      -> SPW 0 channels 127-156 inclusive
   0:127~156,1,2,5:10~20  -> mixed
 
-Solver backends: jax_scipy (default), torch_lbfgs
+Solver backends: jax (default), scipy
 
 Developed by Arpan Pal 2026, NRAO / NCRA
 """
@@ -27,7 +27,7 @@ import yaml
 # ---------------------------------------------------------------------------
 
 VALID_JONES = {"K", "G", "D", "KC", "CP"}
-VALID_BACKENDS = {"jax_scipy", "torch_lbfgs"}
+VALID_BACKENDS = {"jax", "scipy"}
 VALID_TIME_INTERP = {"exact", "nearest", "linear", "cubic"}
 VALID_FIELD_SELECT = {"nearest_time", "nearest_sky", "pinned"}
 
@@ -324,7 +324,7 @@ class SolveBlock:
     tol: float = 1e-10
     memory_limit_gb: float = 0.0
 
-    solver_backend: str = "jax_scipy"
+    solver_backend: str = "jax"
     n_workers: int = 0          # 0 = auto
     gpu: bool = False           # auto-detect; True = force GPU
 
@@ -397,8 +397,10 @@ def _ensure_list(x, n: int) -> list:
 
 
 def _validate_jones(jones_list: List[str]) -> None:
+    import re
     for j in jones_list:
-        if j not in VALID_JONES:
+        base = re.sub(r'\d+$', '', j)
+        if base not in VALID_JONES:
             raise ValueError(
                 f"Unknown Jones type: {j!r}. Valid: {sorted(VALID_JONES)}")
 
@@ -456,7 +458,7 @@ def _parse_solve_block(d: Dict[str, Any]) -> SolveBlock:
                 f"Valid: {sorted(VALID_TIME_INTERP)}")
 
     # Solver backend
-    backend = d.get("solver_backend", "jax_scipy")
+    backend = d.get("solver_backend", "jax")
     _validate_backend(backend)
 
     # External preapply

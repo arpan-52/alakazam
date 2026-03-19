@@ -15,9 +15,8 @@ import logging, time as _time
 from typing import Any, Dict, Optional
 import numpy as np
 from scipy.optimize import least_squares
-from . import JonesSolver, solve_lbfgsb_jax
+from . import JonesSolver, solve_jax_bfgs
 from ..jones.constructors import cross_delay_to_jones
-from ..jones.constructors_ad import cost_cross_freq_np
 from ..jones.algebra import compute_residual_cross_freq
 
 logger = logging.getLogger("alakazam")
@@ -34,7 +33,7 @@ class CrossDelaySolver(JonesSolver):
                        dtype=np.float64)
 
         result = None
-        if self.backend == "jax_scipy":
+        if self.backend == "jax":
             result = self._solve_jax(
                 x0, vis_obs, vis_model, ant1, ant2, freqs, n_ant)
         if result is None:
@@ -43,12 +42,11 @@ class CrossDelaySolver(JonesSolver):
         x_opt, cost, n_iter, conv = result
 
         tau = float(x_opt[0])
-        J_full = cross_delay_to_jones(tau, freqs, n_ant)  # (n_ant, n_freq, 2, 2)
-        J_mean = J_full.mean(axis=1)  # (n_ant, 2, 2)
+        J_full = cross_delay_to_jones(tau, freqs, n_ant)
+        J_mean = J_full.mean(axis=1)
 
         wall = _time.time() - t0
-        return {"jones": J_mean, "native_params": {"type": "KC", "tau_cross": tau},
-                "converged": conv, "n_iter": n_iter, "cost": cost,
+        return {"jones": J_mean, "converged": conv, "n_iter": n_iter, "cost": cost,
                 "wall_time": wall, "solver_backend": self.backend}
 
     def _solve_scipy_lm(self, x0, vis_obs, vis_model, a1, a2, freqs, na):
@@ -70,7 +68,7 @@ class CrossDelaySolver(JonesSolver):
                 dp = vis_obs[:,:,0,1] - Jp[0,:][jnp.newaxis,:]*vis_model[:,:,0,1]
                 dq = vis_obs[:,:,1,0] - vis_model[:,:,1,0]*jnp.conj(Jp[0,:][jnp.newaxis,:])
                 return 0.5*(jnp.sum(dp.real**2+dp.imag**2)+jnp.sum(dq.real**2+dq.imag**2))
-            return solve_lbfgsb_jax(cost, x0, self.max_iter, self.tol)
+            return solve_jax_bfgs(cost, x0, self.max_iter, self.tol)
         except ImportError:
             return None
 

@@ -15,9 +15,8 @@ import logging, time as _time
 from typing import Any, Dict, Optional
 import numpy as np
 from scipy.optimize import least_squares
-from . import (JonesSolver, initial_guess_cross_phase, solve_lbfgsb_jax)
+from . import (JonesSolver, initial_guess_cross_phase, solve_jax_bfgs)
 from ..jones.constructors import cross_phase_to_jones
-from ..jones.constructors_ad import cost_cross_np
 from ..jones.algebra import compute_residual_cross
 
 logger = logging.getLogger("alakazam")
@@ -39,7 +38,7 @@ class CrossPhaseSolver(JonesSolver):
         x0 = np.array([phi_init], dtype=np.float64)
 
         result = None
-        if self.backend == "jax_scipy":
+        if self.backend == "jax":
             result = self._solve_jax(x0, obs, model, ant1, ant2, n_ant)
         if result is None:
             result = self._solve_scipy_lm(x0, obs, model, ant1, ant2, n_ant)
@@ -48,8 +47,7 @@ class CrossPhaseSolver(JonesSolver):
         phi = float(x_opt[0])
         J = cross_phase_to_jones(phi, n_ant)
         wall = _time.time() - t0
-        return {"jones": J, "native_params": {"type": "CP", "phi_cross": phi},
-                "converged": conv, "n_iter": n_iter, "cost": cost,
+        return {"jones": J, "converged": conv, "n_iter": n_iter, "cost": cost,
                 "wall_time": wall, "solver_backend": self.backend}
 
     def _solve_scipy_lm(self, x0, obs, model, a1, a2, na):
@@ -68,6 +66,6 @@ class CrossPhaseSolver(JonesSolver):
                 dp = obs[:, 0, 1] - model[:, 0, 1] * jnp.conj(val)
                 dq = obs[:, 1, 0] - val * model[:, 1, 0]
                 return 0.5*(jnp.sum(dp.real**2+dp.imag**2)+jnp.sum(dq.real**2+dq.imag**2))
-            return solve_lbfgsb_jax(cost, x0, self.max_iter, self.tol)
+            return solve_jax_bfgs(cost, x0, self.max_iter, self.tol)
         except ImportError:
             return None

@@ -138,9 +138,13 @@ def run_fluxscale(fb: FluxscaleBlock) -> None:
     else:
         copy_solutions(fb.transfer_table, output)
 
+    logger.info(f"  Jones type: {jones_type}")
+    logger.info(f"  Reference: {fb.reference_field} from {fb.reference_table}")
+    logger.info(f"  Transfer:  {fb.transfer_field} from {fb.transfer_table}")
+
     for ref_field in fb.reference_field:
         for trn_field in fb.transfer_field:
-            logger.info(f"fluxscale: {ref_field} -> {trn_field}")
+            logger.info(f"  Bootstrapping: {ref_field} -> {trn_field}")
 
             for spw in spws:
                 try:
@@ -149,11 +153,15 @@ def run_fluxscale(fb: FluxscaleBlock) -> None:
                     trn_data = load_solutions(
                         fb.transfer_table, jones_type, trn_field, spw)
                 except KeyError as e:
-                    logger.error(f"fluxscale: {e}")
+                    logger.error(f"    SPW {spw}: {e}")
                     continue
 
                 sp, sq, scp, scq, n_ant = compute_scale(
                     ref_data["jones"], trn_data["jones"])
+
+                logger.info(f"    SPW {spw}: scale_p={sp:.4f} scale_q={sq:.4f} "
+                            f"(scatter: {scp:.4f}, {scq:.4f}) "
+                            f"using {n_ant} antennas")
 
                 rescale_solutions(output, jones_type, trn_field,
                                   spw, sp, sq)
@@ -169,4 +177,4 @@ def run_fluxscale(fb: FluxscaleBlock) -> None:
                     jones_type=jones_type,
                 )
 
-    logger.info(f"fluxscale: written to {output}")
+    logger.info(f"  Fluxscale saved to {output}")

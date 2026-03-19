@@ -5,7 +5,7 @@ solve:
   - ms: newdata.ms
     output: newcal.h5
     ref_ant: C04
-    solver_backend: jax_scipy
+    solver_backend: jax
 
     jones: [G]
     field: [3C286]

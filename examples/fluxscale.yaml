@@ -4,7 +4,7 @@ solve:
   - ms: allcals.ms
     output: gains.h5
     ref_ant: C04
-    solver_backend: jax_scipy
+    solver_backend: jax
 
     jones: [K, G]
     field:

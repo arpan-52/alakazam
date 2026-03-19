@@ -21,9 +21,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-torch = ["torch>=2.0"]
-casacore = ["python-casacore>=3.5"]
-all = ["jax>=0.4", "jaxlib>=0.4", "torch>=2.0", "python-casacore>=3.5"]
+all = ["jax>=0.4", "jaxlib>=0.4", "python-casacore>=3.5"]
 
 [project.scripts]
 alakazam = "alakazam.cli:main"
