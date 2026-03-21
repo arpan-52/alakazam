@@ -1,11 +1,18 @@
-# Use solutions from a previous run as preapply
-# Solve only G1 with K0 and G0 from a previous cal table
+# External preapply: re-solve gains using solutions from a prior run
+#
+# Scenario: you have K0 and G0 from a previous calibration (oldcal.h5).
+# You want to solve a new G on new data, with the old K0+G0 preapplied.
+#
+# The external_preapply block tells the solver to load K0 and G0 from
+# oldcal.h5 and preapply them before solving the new G step.
+#
+# At apply time, the full chain is: old K0 + old G0 + new G0.
 
 solve:
   - ms: newdata.ms
     output: newcal.h5
     ref_ant: C04
-    solver_backend: jax
+    solver_backend: ceres
 
     jones: [G]
     field: [3C286]
@@ -22,6 +29,8 @@ solve:
 apply:
   - ms: newdata.ms
     output_col: CORRECTED_DATA
+
+    # Full chain: old K0 + old G0 + new G0
     jones:  [K0, G0, G0]
     tables: [oldcal.h5, oldcal.h5, newcal.h5]
     field_select: nearest_time

@@ -1,22 +1,31 @@
-# Solve gains on both calibrators, then bootstrap flux from 3C286 to 3C147
+# Flux bootstrapping: 3C286 (known flux) -> 3C147 (transfer calibrator)
+#
+# 1. Solve K+G on both calibrators
+# 2. Bootstrap flux scale from 3C286 to 3C147
+#    - Computes per-antenna gain amplitude ratios
+#    - Iterative 3-sigma clipping (3 iterations) to reject outlier antennas
+#    - Rescales 3C147 gains by sqrt(scale)
+# 3. Apply to science with the flux-scaled gains
+#
+# Note: jones_type in fluxscale refers to the HDF5 key (G0), not bare type (G).
 
 solve:
   - ms: allcals.ms
     output: gains.h5
     ref_ant: C04
-    solver_backend: jax
+    solver_backend: ceres
 
     jones: [K, G]
     field:
-      - [3C286, 3C147]
-      - [3C286, 3C147]
+      - [3C286, 3C147]     # K: solve on both
+      - [3C286, 3C147]     # G: solve on both
     time_interval: [scan, 5min]
     freq_interval: [full, full]
     preapply_time_interp: [exact, nearest]
 
 fluxscale:
   - reference_table: gains.h5
-    reference_field: 3C286
+    reference_field: [3C286]
     transfer_table: gains.h5
     transfer_field: [3C147]
     output: gains_scaled.h5

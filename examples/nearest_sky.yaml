@@ -1,0 +1,31 @@
+# Nearest-sky field selection: pick calibrator closest on the sky
+#
+# Use case: multiple calibrators at different positions. For each target
+# field, use the calibrator with the smallest angular distance.
+#
+# RA/Dec are stored in HDF5 attrs from the MS FIELD table during solve.
+# Falls back to nearest_time if RA/Dec not available.
+
+solve:
+  - ms: survey.ms
+    output: cal.h5
+    ref_ant: 0
+    solver_backend: ceres
+
+    jones: [K, G]
+    field:
+      - [3C48, 3C147, 3C286]     # K: three calibrators spread across sky
+      - [3C48, 3C147, 3C286]     # G: same three
+    time_interval: [scan, 5min]
+    freq_interval: [full, full]
+    preapply_time_interp: [exact, nearest]
+
+apply:
+  - ms: survey.ms
+    output_col: CORRECTED_DATA
+    target_field: [J0742-2822, J1331+3030, J2355+4950]
+
+    jones:        [K0,           G0          ]
+    tables:       [cal.h5,       cal.h5      ]
+    field_select: [nearest_sky,  nearest_sky ]
+    time_interp:  [nearest,      linear      ]

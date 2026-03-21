@@ -1,36 +1,43 @@
 # Delay + bandpass + time-variable gains
-# K0: delay per scan, full band
-# G0: bandpass (one solution across all time, 2 MHz freq bins)
-# G1: time gains (2 min bins, full band)
+#
+# K0: delay per scan, full band — fits across frequency, one delay per pol
+# G0: bandpass — one solution across all time, 2 MHz frequency bins
+# G1: time gains — 2 min bins, full band (freq-independent)
+#
+# Both calibrators (3C147, 3C286) are solved for each step.
+# At apply time, nearest_time picks the calibrator closest in time
+# for each target timestep.
+#
+# Parang correction applied during both solve and apply.
 
 solve:
-  - ms: /path/to/calibrators.ms
+  - ms: calibrators.ms
     output: cal.h5
     ref_ant: C04
     data_col: DATA
     model_col: MODEL_DATA
     apply_parang: true
-    solver_backend: jax
+    solver_backend: ceres
     rfi_threshold: 5.0
 
     jones: [K, G, G]
 
     field:
-      - [3C147, 3C286]
-      - [3C147, 3C286]
-      - [3C147, 3C286]
+      - [3C147, 3C286]      # K: solve on both calibrators
+      - [3C147, 3C286]      # G0 bandpass: both calibrators
+      - [3C147, 3C286]      # G1 time gains: both calibrators
 
     time_interval: [scan, inf, 2min]
     freq_interval: [full, 2MHz, full]
     preapply_time_interp: [exact, nearest, nearest]
 
 apply:
-  - ms: /path/to/science.ms
+  - ms: science.ms
     output_col: CORRECTED_DATA
     apply_parang: true
     propagate_flags: true
 
     jones:        [K0,            G0,            G1           ]
-    tables:       [cal.h5,       cal.h5,       cal.h5        ]
-    field_select: [nearest_time, nearest_time, nearest_time  ]
-    time_interp:  [nearest,      nearest,      linear        ]
+    tables:       [cal.h5,        cal.h5,        cal.h5       ]
+    field_select: [nearest_time,  nearest_time,  nearest_time ]
+    time_interp:  [nearest,       nearest,       linear       ]

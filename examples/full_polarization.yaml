@@ -1,27 +1,34 @@
 # Full polarization calibration
-# K0: parallel delay
-# G0: bandpass gains (freq-dependent)
-# G1: time-variable gains
-# D0: leakage
-# KC0: cross-hand delay
-# CP0: cross-hand phase
+#
+# K0:  parallel delay — fits across frequency, one delay per pol per antenna
+# G0:  bandpass gains — freq-dependent (4 MHz bins), single time solution
+# G1:  time-variable gains — 5 min bins, freq-independent
+# D0:  leakage — full 2x2 matrix [[1, d_pq], [d_qp, 1]]
+# KC0: cross-hand delay — single global parameter, fits across frequency
+# CP0: cross-hand phase — single global parameter
+#
+# Solve chain: K0 -> preapply K0 -> G0 -> preapply K0+G0 -> G1 -> ...
+# Each step automatically preapplies all prior Jones terms.
+#
+# Parang correction is required for polarization calibration.
+# Parallactic angle is time- and antenna-dependent, freq-independent.
 
 solve:
   - ms: polcal.ms
     output: polcal.h5
     ref_ant: 9
     apply_parang: true
-    solver_backend: jax
+    solver_backend: ceres
 
     jones: [K, G, G, D, KC, CP]
 
     field:
-      - [3C286]        # K
-      - [3C286]        # G bandpass
-      - [3C286]        # G time
-      - [3C286]        # D
-      - [3C286]        # KC
-      - [3C286]        # CP
+      - [3C286]        # K:  delay calibrator
+      - [3C286]        # G0: bandpass calibrator
+      - [3C286]        # G1: time gain calibrator
+      - [3C286]        # D:  leakage calibrator (needs polarized source)
+      - [3C286]        # KC: cross delay
+      - [3C286]        # CP: cross phase
 
     time_interval: [scan, inf, 5min, inf, inf, inf]
     freq_interval: [full, 4MHz, full, full, full, full]
@@ -33,7 +40,7 @@ apply:
     apply_parang: true
     propagate_flags: true
 
-    jones:  [K0, G0, G1, D0, KC0, CP0]
+    jones:  [K0,  G0,  G1,  D0,  KC0, CP0]
     tables: [polcal.h5, polcal.h5, polcal.h5, polcal.h5, polcal.h5, polcal.h5]
     field_select: nearest_time
     time_interp: [nearest, nearest, linear, nearest, nearest, nearest]

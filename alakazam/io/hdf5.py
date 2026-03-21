@@ -204,14 +204,31 @@ def _load_group(g) -> Dict[str, Any]:
             "ra_rad": ra, "dec_rad": dec}
 
 
+def _resolve_jones_key(f, jones_type):
+    """Resolve jones key: exact match first, then prefix match.
+
+    Solve writes numbered keys (K0, G0, G1). Apply config may use bare
+    types (K, G). This resolves "K" → "K0" when exact match fails.
+    """
+    if jones_type in f:
+        return jones_type
+    matches = sorted(k for k in f.keys()
+                     if k.startswith(jones_type) and k != "metadata")
+    if matches:
+        logger.debug(f"jones key {jones_type!r} resolved to {matches[0]!r}")
+        return matches[0]
+    return None
+
+
 def load_all_fields(path: str, jones_type: str, spw: int,
                     field_names: Optional[List[str]] = None) -> Dict[str, Dict]:
     """Load all fields for a jones type/spw, concatenating scans."""
     result = {}
     with h5py.File(path, "r") as f:
-        if jones_type not in f:
+        resolved = _resolve_jones_key(f, jones_type)
+        if resolved is None:
             return {}
-        jg = f[jones_type]
+        jg = f[resolved]
         for fkey in jg.keys():
             if not fkey.startswith("field_"):
                 continue
@@ -220,7 +237,7 @@ def load_all_fields(path: str, jones_type: str, spw: int,
             if field_names is not None and fname not in field_names:
                 continue
             try:
-                sol = load_solutions(path, jones_type, fname, spw)
+                sol = load_solutions(path, resolved, fname, spw)
             except KeyError:
                 continue
             result[fname] = sol

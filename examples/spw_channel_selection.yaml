@@ -1,0 +1,37 @@
+# SPW and channel selection (CASA syntax)
+#
+# Common patterns:
+#   spw: "0"                -> SPW 0 all channels
+#   spw: "0:127~156"        -> SPW 0 channels 127-156 inclusive
+#   spw: "0:10~500,1,2"     -> SPW 0 ch10-500, SPW 1+2 all channels
+#   spw: "0,1,2,3"          -> SPWs 0-3 all channels
+#
+# Per-step SPW override with step_spw:
+#   step_spw overrides the global spw for specific solve steps.
+#   Useful when K needs all channels but G only needs a subset.
+
+solve:
+  - ms: wideband.ms
+    output: cal.h5
+    ref_ant: C04
+    solver_backend: ceres
+    spw: "0:100~1900"            # global: skip edge channels
+
+    jones: [K, G, G]
+    field:
+      - [3C286]
+      - [3C286]
+      - [3C286]
+    time_interval: [scan, inf, 2min]
+    freq_interval: [full, 2MHz, full]
+    preapply_time_interp: [exact, nearest, nearest]
+
+apply:
+  - ms: wideband.ms
+    output_col: CORRECTED_DATA
+    spw: "0:100~1900"            # same channel selection as solve
+
+    jones:  [K0, G0, G1]
+    tables: [cal.h5, cal.h5, cal.h5]
+    field_select: nearest_time
+    time_interp: [nearest, nearest, linear]

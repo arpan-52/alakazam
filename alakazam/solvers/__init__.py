@@ -28,15 +28,51 @@ logger = logging.getLogger("alakazam")
 # Backend detection
 # -------------------------------------------------------------------
 
+_jax_device = None   # resolved once by detect_device, reused everywhere
+
 def detect_device(backend: str, force_gpu: bool = False) -> str:
-    if backend == "jax":
+    """Probe JAX GPU once. If GPU works, use it; otherwise fall back to CPU.
+    Suppresses CuDNN/CUDA stderr noise during the probe."""
+    global _jax_device
+    if backend in ("ceres", "scipy"):
+        return "cpu"
+    if _jax_device is not None:
+        return "gpu" if _jax_device.platform == "gpu" else "cpu"
+    if backend != "jax":
+        return "cpu"
+    import os, sys
+    try:
+        # Suppress CuDNN stderr during probe
+        stderr_fd = sys.stderr.fileno()
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        saved_stderr = os.dup(stderr_fd)
+        os.dup2(devnull, stderr_fd)
+        os.close(devnull)
         try:
             import jax
-            if any(d.platform == "gpu" for d in jax.devices()) or force_gpu:
-                return "gpu"
+            import jax.numpy as jnp
+            gpus = [d for d in jax.devices() if d.platform == "gpu"]
+            if gpus or force_gpu:
+                # Actually run something on GPU to catch CuDNN mismatches
+                with jax.default_device(gpus[0]):
+                    _ = jnp.ones(2, dtype=jnp.float64).sum().block_until_ready()
+                _jax_device = gpus[0]
         except Exception:
             pass
-    return "cpu"
+        finally:
+            os.dup2(saved_stderr, stderr_fd)
+            os.close(saved_stderr)
+    except Exception:
+        pass
+
+    if _jax_device is None:
+        try:
+            import jax
+            _jax_device = jax.devices("cpu")[0]
+        except Exception:
+            return "cpu"
+
+    return "gpu" if _jax_device.platform == "gpu" else "cpu"
 
 
 # -------------------------------------------------------------------
@@ -97,27 +133,32 @@ def bfs_order(adj, root):
 # -------------------------------------------------------------------
 
 def solve_jax_bfgs(cost_fn_jax, x0, max_iter, tol):
-    """Pure JAX BFGS optimizer using jax.scipy.optimize.minimize."""
+    """Pure JAX BFGS optimizer using jax.scipy.optimize.minimize.
+    Runs on the device chosen by detect_device (GPU if available, else CPU)."""
     try:
         import jax
         import jax.numpy as jnp
         from jax import jit
+        from jax.scipy.optimize import minimize as jax_minimize
+
+        device = _jax_device or jax.devices("cpu")[0]
 
         @jit
         def _minimize(x0_jax):
-            return jax.scipy.optimize.minimize(
+            return jax_minimize(
                 cost_fn_jax, x0_jax, method="BFGS",
                 options={"maxiter": max_iter, "gtol": tol})
 
-        x0_jax = jnp.array(x0, dtype=jnp.float64)
-        result = _minimize(x0_jax)
-        return (np.array(result.x, dtype=np.float64),
-                float(result.fun), int(result.nit),
-                bool(result.converged))
+        with jax.default_device(device):
+            x0_jax = jnp.array(x0, dtype=jnp.float64)
+            result = _minimize(x0_jax)
+            return (np.array(result.x, dtype=np.float64),
+                    float(result.fun), int(result.nit),
+                    bool(result.success))
     except ImportError:
         return None
     except Exception as e:
-        logger.warning(f"JAX solver failed ({e}), falling back to scipy LM")
+        logger.warning(f"JAX BFGS failed ({e}), falling back to scipy LM")
         return None
 
 

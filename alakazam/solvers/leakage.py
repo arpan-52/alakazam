@@ -4,6 +4,7 @@ Receives: (n_bl, 2, 2) — time+freq averaged.
 Returns:  (n_ant, 2, 2).
 
 Initial guess: cross/parallel ratio from corrected data.
+Backends: ceres (default), scipy, jax.
 Ref ant: d_pq[ref] = 0, d_qp[ref] FREE.
 
 Feed-basis aware: uses appropriate initial guess for LINEAR vs CIRCULAR.
@@ -12,16 +13,96 @@ Developed by Arpan Pal 2026, NRAO / NCRA
 """
 
 from __future__ import annotations
-import logging, time as _time
+import logging, os, time as _time
 from typing import Any, Dict, Optional
 import numpy as np
-from scipy.optimize import least_squares
-from . import (JonesSolver, initial_guess_leakage, solve_jax_bfgs)
+import pyceres
+from . import (JonesSolver, initial_guess_leakage)
 from ..jones.constructors import leakage_to_jones
 from ..jones.algebra import compute_residual_2x2
 
 logger = logging.getLogger("alakazam")
 
+
+# ======================================================================
+# Ceres cost function — per baseline, full 2x2
+# ======================================================================
+
+class _LeakageCost(pyceres.CostFunction):
+    """Full 2x2 visibility residual for one baseline.
+
+    pred = J_i M J_j^H  where J = [[1, d_pq], [d_qp, 1]].
+    8 residuals (re/im for each of 4 matrix elements).
+    4 param blocks of size 2:
+      [Re(d_pq_i), Im(d_pq_i)], [Re(d_qp_i), Im(d_qp_i)],
+      [Re(d_pq_j), Im(d_pq_j)], [Re(d_qp_j), Im(d_qp_j)].
+    """
+
+    def __init__(self, obs_22, model_22):
+        super().__init__()
+        self.obs = obs_22
+        self.model = model_22
+        self.set_num_residuals(8)
+        self.set_parameter_block_sizes([2, 2, 2, 2])
+
+    def Evaluate(self, parameters, residuals, jacobians):
+        dp_i = parameters[0][0] + 1j * parameters[0][1]
+        dq_i = parameters[1][0] + 1j * parameters[1][1]
+        dp_j = parameters[2][0] + 1j * parameters[2][1]
+        dq_j = parameters[3][0] + 1j * parameters[3][1]
+
+        Ji = np.array([[1.0, dp_i], [dq_i, 1.0]], dtype=np.complex128)
+        Jj = np.array([[1.0, dp_j], [dq_j, 1.0]], dtype=np.complex128)
+        JjH = Jj.conj().T
+        pred = Ji @ self.model @ JjH
+        diff = self.obs - pred
+
+        residuals[0] = diff[0, 0].real; residuals[1] = diff[0, 0].imag
+        residuals[2] = diff[0, 1].real; residuals[3] = diff[0, 1].imag
+        residuals[4] = diff[1, 0].real; residuals[5] = diff[1, 0].imag
+        residuals[6] = diff[1, 1].real; residuals[7] = diff[1, 1].imag
+
+        if jacobians is not None:
+            MJjH = self.model @ JjH
+            JiM = Ji @ self.model
+
+            if jacobians[0] is not None:  # d/d [Re(dp_i), Im(dp_i)]
+                # dJi/d(Re dp_i) = [[0,1],[0,0]] → dpred row0 += MJjH[1,:]
+                dps = [np.array([[MJjH[1, 0], MJjH[1, 1]], [0.0, 0.0]], dtype=np.complex128),
+                       np.array([[1j*MJjH[1, 0], 1j*MJjH[1, 1]], [0.0, 0.0]], dtype=np.complex128)]
+                _fill_jac_2(jacobians[0], dps)
+
+            if jacobians[1] is not None:  # d/d [Re(dq_i), Im(dq_i)]
+                dps = [np.array([[0.0, 0.0], [MJjH[0, 0], MJjH[0, 1]]], dtype=np.complex128),
+                       np.array([[0.0, 0.0], [1j*MJjH[0, 0], 1j*MJjH[0, 1]]], dtype=np.complex128)]
+                _fill_jac_2(jacobians[1], dps)
+
+            if jacobians[2] is not None:  # d/d [Re(dp_j), Im(dp_j)]
+                # dJjH/d(Re dp_j) = [[0,0],[1,0]], dJjH/d(Im dp_j) = [[0,0],[-1j,0]]
+                dps = [np.array([[JiM[0, 1], 0.0], [JiM[1, 1], 0.0]], dtype=np.complex128),
+                       np.array([[-1j*JiM[0, 1], 0.0], [-1j*JiM[1, 1], 0.0]], dtype=np.complex128)]
+                _fill_jac_2(jacobians[2], dps)
+
+            if jacobians[3] is not None:  # d/d [Re(dq_j), Im(dq_j)]
+                # dJjH/d(Re dq_j) = [[0,1],[0,0]], dJjH/d(Im dq_j) = [[0,-1j],[0,0]]
+                dps = [np.array([[0.0, JiM[0, 0]], [0.0, JiM[1, 0]]], dtype=np.complex128),
+                       np.array([[0.0, -1j*JiM[0, 0]], [0.0, -1j*JiM[1, 0]]], dtype=np.complex128)]
+                _fill_jac_2(jacobians[3], dps)
+        return True
+
+
+def _fill_jac_2(jac, dps):
+    """Fill a Ceres Jacobian array for 8 residuals × 2 params (row-major)."""
+    for idx, dp in enumerate(dps):
+        jac[0*2 + idx] = -dp[0, 0].real; jac[1*2 + idx] = -dp[0, 0].imag
+        jac[2*2 + idx] = -dp[0, 1].real; jac[3*2 + idx] = -dp[0, 1].imag
+        jac[4*2 + idx] = -dp[1, 0].real; jac[5*2 + idx] = -dp[1, 0].imag
+        jac[6*2 + idx] = -dp[1, 1].real; jac[7*2 + idx] = -dp[1, 1].imag
+
+
+# ======================================================================
+# Solver
+# ======================================================================
 
 class LeakageSolver(JonesSolver):
     jones_type = "D"
@@ -37,20 +118,22 @@ class LeakageSolver(JonesSolver):
 
         logger.info(f"D solve: feed_basis={self.feed_basis}")
 
-        # Initial guess from data (feed-basis aware)
         d_pq_init, d_qp_init = initial_guess_leakage(
             obs, model, ant1, ant2, n_ant, self.ref_ant,
             feed_basis=self.feed_basis)
 
-        # Pack: [Re(d_pq), Im(d_pq), Re(d_qp), Im(d_qp)]
-        x0 = np.concatenate([d_pq_init.real, d_pq_init.imag,
-                              d_qp_init.real, d_qp_init.imag])
+        if self.backend == "ceres":
+            result = self._solve_ceres(
+                d_pq_init, d_qp_init, obs, model, ant1, ant2, n_ant)
+        elif self.backend == "scipy":
+            result = self._solve_scipy_lm(
+                d_pq_init, d_qp_init, obs, model, ant1, ant2, n_ant)
+        elif self.backend == "jax":
+            result = self._solve_jax(
+                d_pq_init, d_qp_init, obs, model, ant1, ant2, n_ant)
+        else:
+            raise ValueError(f"Unknown backend: {self.backend!r}")
 
-        result = None
-        if self.backend == "jax":
-            result = self._solve_jax(x0, obs, model, ant1, ant2, n_ant)
-        if result is None:
-            result = self._solve_scipy_lm(x0, obs, model, ant1, ant2, n_ant)
         x_opt, cost, n_iter, conv = result
 
         d_pq, d_qp = self._unpack(x_opt, n_ant)
@@ -65,32 +148,85 @@ class LeakageSolver(JonesSolver):
         d_pq[self.ref_ant] = 0.0
         return d_pq, d_qp
 
-    def _solve_scipy_lm(self, x0, obs, model, a1, a2, na):
+    def _pack(self, d_pq, d_qp):
+        return np.concatenate([d_pq.real, d_pq.imag, d_qp.real, d_qp.imag])
+
+    # ------------------------------------------------------------------
+    # Ceres LM
+    # ------------------------------------------------------------------
+
+    def _solve_ceres(self, dpq_init, dqp_init, obs, model, a1, a2, na):
+        params_dpq = [np.array([dpq_init[a].real, dpq_init[a].imag]) for a in range(na)]
+        params_dqp = [np.array([dqp_init[a].real, dqp_init[a].imag]) for a in range(na)]
+
+        prob = pyceres.Problem()
+        for k in range(len(a1)):
+            i, j = int(a1[k]), int(a2[k])
+            prob.add_residual_block(
+                _LeakageCost(obs[k], model[k]),
+                None, [params_dpq[i], params_dqp[i], params_dpq[j], params_dqp[j]])
+
+        # Only fix d_pq at ref — d_qp stays free
+        prob.set_parameter_block_constant(params_dpq[self.ref_ant])
+
+        from .parallel_delay import _ceres_opts
+        opts = _ceres_opts(self.max_iter, self.tol)
+        summary = pyceres.SolverSummary()
+        pyceres.solve(opts, prob, summary)
+
+        dpq_out = np.zeros(na, dtype=np.complex128)
+        dqp_out = np.zeros(na, dtype=np.complex128)
+        for a in range(na):
+            dpq_out[a] = params_dpq[a][0] + 1j * params_dpq[a][1]
+            dqp_out[a] = params_dqp[a][0] + 1j * params_dqp[a][1]
+        dpq_out[self.ref_ant] = 0.0
+
+        return (self._pack(dpq_out, dqp_out), float(summary.final_cost),
+                summary.num_successful_steps,
+                summary.termination_type == pyceres.TerminationType.CONVERGENCE)
+
+    # ------------------------------------------------------------------
+    # scipy LM
+    # ------------------------------------------------------------------
+
+    def _solve_scipy_lm(self, dpq_init, dqp_init, obs, model, a1, a2, na):
+        from scipy.optimize import least_squares
         ref = self.ref_ant
+
+        x0 = self._pack(dpq_init, dqp_init)
+
         def _res(x):
-            dp = x[:na] + 1j*x[na:2*na]; dq = x[2*na:3*na] + 1j*x[3*na:]
+            dp = x[:na] + 1j * x[na:2*na]
+            dq = x[2*na:3*na] + 1j * x[3*na:]
             dp[ref] = 0.0
             return compute_residual_2x2(leakage_to_jones(dp, dq), obs, model, a1, a2)
+
         r = least_squares(_res, x0, method="lm", max_nfev=self.max_iter*len(x0),
                           ftol=self.tol, xtol=self.tol, gtol=self.tol)
         return r.x, float(r.cost), r.nfev, r.success
 
-    def _solve_jax(self, x0, obs, model, a1, a2, na):
+    # ------------------------------------------------------------------
+    # jax BFGS
+    # ------------------------------------------------------------------
+
+    def _solve_jax(self, dpq_init, dqp_init, obs, model, a1, a2, na):
+        from . import solve_jax_bfgs
         ref = self.ref_ant
-        try:
-            import jax.numpy as jnp
-            def cost(x):
-                dpr = x[:na]; dpi = x[na:2*na]
-                dqr = x[2*na:3*na]; dqi = x[3*na:]
-                dpr = dpr.at[ref].set(0.0); dpi = dpi.at[ref].set(0.0)
-                dp = dpr + 1j*dpi; dq = dqr + 1j*dqi
-                J = jnp.zeros((na, 2, 2), dtype=jnp.complex128)
-                J = J.at[:, 0, 0].set(1.0); J = J.at[:, 0, 1].set(dp)
-                J = J.at[:, 1, 0].set(dq); J = J.at[:, 1, 1].set(1.0)
-                Ji = J[a1]; JjH = jnp.conj(J[a2]).transpose(0, 2, 1)
-                pred = jnp.einsum("bij,bjk,bkl->bil", Ji, model, JjH)
-                d = obs - pred
-                return 0.5 * jnp.sum(d.real**2 + d.imag**2)
-            return solve_jax_bfgs(cost, x0, self.max_iter, self.tol)
-        except ImportError:
-            return None
+        import jax.numpy as jnp
+
+        x0 = self._pack(dpq_init, dqp_init)
+
+        def cost(x):
+            dpr = x[:na]; dpi = x[na:2*na]
+            dqr = x[2*na:3*na]; dqi = x[3*na:]
+            dpr = dpr.at[ref].set(0.0); dpi = dpi.at[ref].set(0.0)
+            dp = dpr + 1j*dpi; dq = dqr + 1j*dqi
+            J = jnp.zeros((na, 2, 2), dtype=jnp.complex128)
+            J = J.at[:, 0, 0].set(1.0); J = J.at[:, 0, 1].set(dp)
+            J = J.at[:, 1, 0].set(dq); J = J.at[:, 1, 1].set(1.0)
+            Ji = J[a1]; JjH = jnp.conj(J[a2]).transpose(0, 2, 1)
+            pred = jnp.einsum("bij,bjk,bkl->bil", Ji, model, JjH)
+            d = obs - pred
+            return 0.5 * jnp.sum(d.real**2 + d.imag**2)
+
+        return solve_jax_bfgs(cost, x0, self.max_iter, self.tol)
