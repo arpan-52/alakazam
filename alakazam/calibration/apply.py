@@ -182,6 +182,22 @@ def _remap_jones(jones, sol_ant_names, active_names):
     return J
 
 
+def _remap_delay(delay, sol_ant_names, active_names):
+    """Remap delay from solution antenna order to active antenna order by name.
+
+    delay: (n_sol_ant, n_freq, n_time, 2)
+    Returns: (n_active, n_freq, n_time, 2). Unmatched antennas get zero delay.
+    """
+    n_active = len(active_names)
+    shape = (n_active,) + delay.shape[1:]
+    D = np.zeros(shape, dtype=delay.dtype)
+    sol_map = {name: i for i, name in enumerate(sol_ant_names)}
+    for act_idx, name in enumerate(active_names):
+        if name in sol_map:
+            D[act_idx] = delay[sol_map[name]]
+    return D
+
+
 def _load_term(term, spw, meta, target_fname, active_names):
     import json
     raw = load_all_fields(term.table, term.jones, spw)
@@ -196,9 +212,15 @@ def _load_term(term, spw, meta, target_fname, active_names):
             sol_ant_names = json.loads(attrs["ant_names"])
             if sol_ant_names != active_names:
                 jones = _remap_jones(jones, sol_ant_names, active_names)
+        delay = sol.get("delay")
+        if delay is not None and "ant_names" in attrs:
+            sol_ant_names = json.loads(attrs["ant_names"])
+            if sol_ant_names != active_names:
+                delay = _remap_delay(delay, sol_ant_names, active_names)
         out[fn] = {
             "times": sol["time"], "freqs": sol.get("freq"),
-            "jones": jones, "ra_rad": sol.get("ra_rad", 0.0),
+            "jones": jones, "delay": delay,
+            "ra_rad": sol.get("ra_rad", 0.0),
             "dec_rad": sol.get("dec_rad", 0.0),
         }
     fields_str = ", ".join(

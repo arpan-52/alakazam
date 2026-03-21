@@ -90,12 +90,31 @@ If `freq_interval: full` then `n_freq=1`. If `time_interval: inf` then `n_time=1
 Only active antennas (those with data in the MS) are stored and processed.
 Antenna names are saved in HDF5 attrs for remapping at apply time.
 
+### Delay storage (K, KC)
+
+Delay solvers (K, KC) additionally store the raw delay values in nanoseconds:
+
+```
+delay:  (n_ant, n_freq, n_time, 2)  float64 — nanoseconds
+```
+
+At apply time, instead of interpolating the Jones matrix (which is only correct at the
+center frequency), the delay is interpolated in time and then the Jones matrix is
+reconstructed at every target channel frequency:
+
+```
+J[a, f, p, p] = exp(-2pi * i * delay[a, p] * 1e-9 * freq[f])
+```
+
+This gives the correct phase rotation at every frequency, not just the center channel.
+
 ## HDF5 layout
 
 ```
 cal.h5
 ├── K0/field_3C286/scan_0/spw_0/
 │   ├── jones        (n_ant, n_freq, n_time, 2, 2)  complex128
+│   ├── delay        (n_ant, n_freq, n_time, 2)      float64 ns  [K/KC only]
 │   ├── flags        (n_ant, n_freq, n_time)          bool
 │   ├── time         (n_time,)  MJD seconds
 │   ├── freq         (n_freq,)  Hz
@@ -249,11 +268,12 @@ Target fields (e.g. science targets) typically have no solutions in the HDF5 —
 
 ### Frequency interpolation
 
-Automatic based on solution vs target grids:
+Automatic based on solution type and grids:
 
 | Condition | Method |
 |-----------|--------|
-| n_sol_freq = 1 | Broadcast (same Jones for all channels) |
+| K/KC (delay stored) | Reconstruct Jones at each target frequency from delay |
+| n_sol_freq = 1 (no delay) | Broadcast (same Jones for all channels) |
 | Grids match exactly | Pass through |
 | Different grids | Nearest-frequency mapping |
 
@@ -263,10 +283,14 @@ Two log lines per Jones term per target field:
 
 ```
 K0: loaded [3C286(3t)] (7 ants)
-K0: 3C286 -> DA240  (nearest_time, time=nearest 3->45, freq=broadcast 1->2048)
+K0: 3C286 -> DA240  (nearest_time, time=nearest 3->45, freq=delay->jones 2048ch)
+G0: loaded [3C286(29t), 3C147(15t)] (7 ants)
+G0: 3C286 -> DA240  (nearest_time, time=linear 29->45, freq=broadcast 1->2048)
 ```
 
-First line: what solutions are available. Second line: what was chosen, why, and how the interpolation maps solution grids onto target grids.
+First line: what solutions are available. Second line: what was chosen, why, and how
+the interpolation maps solution grids onto target grids. For K/KC, `delay->jones`
+indicates delays are reconstructed at every target frequency.
 
 ### Diagonal optimization
 

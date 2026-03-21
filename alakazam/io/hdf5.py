@@ -66,6 +66,7 @@ def save_solutions(
     meta: Dict[str, Any],
     scan_id: int = 0,
     provenance: Optional[Dict] = None,
+    delay: Optional[np.ndarray] = None,  # (n_ant, n_freq, n_time, 2) ns — K/KC only
 ) -> None:
     """Write solutions in universal schema with scan-level hierarchy."""
     mode = "a" if _exists(path) else "w"
@@ -90,6 +91,10 @@ def save_solutions(
         g.create_dataset("flags", data=flags)
         g.create_dataset("time", data=times)
         g.create_dataset("freq", data=freqs)
+
+        # Delay (K/KC only): (n_ant, n_freq, n_time, 2) in nanoseconds
+        if delay is not None:
+            g.create_dataset("delay", data=delay, compression="gzip", compression_opts=4)
 
         # Solver stats per cell
         if solver_stats:
@@ -171,6 +176,11 @@ def load_solutions(path: str, jones_type: str,
         freqs = parts[0]["freq"]
         attrs = parts[0]["attrs"]
 
+        # Delay (K/KC only)
+        delay = None
+        if parts[0]["delay"] is not None:
+            delay = np.concatenate([p["delay"] for p in parts], axis=2)[:, :, sort_idx]
+
         # Merge solver stats
         solver_stats = {}
         if parts[0]["solver_stats"]:
@@ -182,7 +192,7 @@ def load_solutions(path: str, jones_type: str,
         ra = float(attrs.get("field_ra", 0.0))
         dec = float(attrs.get("field_dec", 0.0))
         return {"jones": jones, "flags": flags, "time": times, "freq": freqs,
-                "attrs": attrs, "solver_stats": solver_stats,
+                "delay": delay, "attrs": attrs, "solver_stats": solver_stats,
                 "ra_rad": ra, "dec_rad": dec}
 
 
@@ -192,6 +202,7 @@ def _load_group(g) -> Dict[str, Any]:
     flags = g["flags"][:] if "flags" in g else None
     times = g["time"][:]
     freqs = g["freq"][:] if "freq" in g else None
+    delay = g["delay"][:] if "delay" in g else None
     attrs = dict(g.attrs)
     solver_stats = {}
     if "solver_stats" in g:
@@ -200,7 +211,7 @@ def _load_group(g) -> Dict[str, Any]:
     ra = float(attrs.get("field_ra", 0.0))
     dec = float(attrs.get("field_dec", 0.0))
     return {"jones": jones, "flags": flags, "time": times, "freq": freqs,
-            "attrs": attrs, "solver_stats": solver_stats,
+            "delay": delay, "attrs": attrs, "solver_stats": solver_stats,
             "ra_rad": ra, "dec_rad": dec}
 
 
@@ -351,8 +362,9 @@ def print_summary(path):
                             g = sg[sk]
                             if "jones" not in g: continue
                             s = g["jones"].shape
+                            delay_str = "  delay=yes" if "delay" in g else ""
                             print(f"  [{jt}] {fkey} {sck} {sk}  shape={s}  "
-                                  f"n_ant={s[0]} n_freq={s[1]} n_time={s[2]}")
+                                  f"n_ant={s[0]} n_freq={s[1]} n_time={s[2]}{delay_str}")
                             print(f"    matrix: {g.attrs.get('matrix_form', '')}")
                             print(f"    backend: {g.attrs.get('solver_backend', '?')}")
                     elif sck.startswith("spw_") and "jones" in sg:

@@ -100,7 +100,7 @@ class ParallelDelaySolver(JonesSolver):
 
         wall = _time.time() - t0
         return {
-            "jones": J, "converged": conv, "n_iter": n_iter,
+            "jones": J, "delay": delay, "converged": conv, "n_iter": n_iter,
             "cost": cost, "wall_time": wall,
             "solver_backend": self.backend,
         }

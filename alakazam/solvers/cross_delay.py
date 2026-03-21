@@ -99,9 +99,13 @@ class CrossDelaySolver(JonesSolver):
         freq_mid = np.array([np.mean(freqs)])
         J = cross_delay_to_jones(tau, freq_mid, n_ant)[:, 0]  # (n_ant, 2, 2)
 
+        # Store delay as (n_ant, 2): [tau_cross, 0] per antenna
+        delay = np.zeros((n_ant, 2), dtype=np.float64)
+        delay[:, 0] = tau
+
         wall = _time.time() - t0
-        return {"jones": J, "converged": conv, "n_iter": n_iter, "cost": cost,
-                "wall_time": wall, "solver_backend": self.backend}
+        return {"jones": J, "delay": delay, "converged": conv, "n_iter": n_iter,
+                "cost": cost, "wall_time": wall, "solver_backend": self.backend}
 
     # ------------------------------------------------------------------
     # Ceres LM
