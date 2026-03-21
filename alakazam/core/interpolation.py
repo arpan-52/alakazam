@@ -120,47 +120,53 @@ def _interp_time(sol_times, sol_data, target_times, mode):
 # Single-field interpolation
 # -------------------------------------------------------------------
 
+def _freq_interp_desc(n_sol_freq, sol_freqs, target_freqs):
+    """Return a short string describing the freq interpolation that will happen."""
+    n_tf = len(target_freqs)
+    if n_sol_freq == 1:
+        return f"broadcast 1->{n_tf}"
+    if n_sol_freq == n_tf and sol_freqs is not None and np.allclose(sol_freqs, target_freqs):
+        return f"exact {n_tf}"
+    if sol_freqs is not None:
+        return f"nearest {n_sol_freq}->{n_tf}"
+    return f"passthrough {n_sol_freq}"
+
+
 def interpolate_jones(sol_times, sol_freqs, sol_jones,
                       target_times, target_freqs, time_interp):
     """Interpolate a jones cube onto target time/freq grids.
 
-    sol_jones can be:
-      (n_ant, n_freq, n_time, 2, 2) — full schema from HDF5
-      (n_time, n_ant, 2, 2) — old format (auto-detected)
-      (n_time, n_ant, n_freq, 2, 2) — old format
-
-    Returns: (n_target_t, n_ant, [n_target_f,] 2, 2) for preapply use.
+    sol_jones: (n_ant, n_freq, n_time, 2, 2) — HDF5 schema.
+    Returns: (n_target_t, n_ant, n_target_f, 2, 2) — always 5D.
     """
-    # Detect and normalise to (n_time, n_ant, [n_freq,] 2, 2) for interp
     j = sol_jones
-    if j.ndim == 5 and j.shape[2] != 2:
-        # Could be (n_ant, n_freq, n_time, 2, 2) — our schema
-        # Transpose to (n_time, n_ant, n_freq, 2, 2)
-        if j.shape[-2:] == (2, 2):
-            n_ant, n_freq, n_time = j.shape[:3]
-            j = j.transpose(2, 0, 1, 3, 4)  # (n_time, n_ant, n_freq, 2, 2)
+    # Normalise HDF5 schema (n_ant, n_freq, n_time, 2, 2)
+    # to (n_time, n_ant, n_freq, 2, 2) for time interp
+    if j.ndim == 5 and j.shape[-2:] == (2, 2):
+        n_ant, n_freq, n_time = j.shape[:3]
+        j = j.transpose(2, 0, 1, 3, 4)  # (n_time, n_ant, n_freq, 2, 2)
+    elif j.ndim == 4:
+        # (n_time, n_ant, 2, 2) — no freq axis, add n_freq=1
+        j = j[:, :, np.newaxis, :, :]
 
-    # Now j is (n_time, n_ant, [n_freq,] 2, 2)
+    # j is now (n_time, n_ant, n_freq, 2, 2)
     j_interp = _interp_time(sol_times, j, target_times, time_interp)
+    # j_interp: (n_target_t, n_ant, n_freq, 2, 2)
 
-    if target_freqs is None:
+    n_t, n_ant, n_sf = j_interp.shape[:3]
+    n_tf = len(target_freqs)
+
+    # Freq-independent solution (n_freq=1): broadcast to target freqs
+    if n_sf == 1:
+        return np.broadcast_to(
+            j_interp, (n_t, n_ant, n_tf, 2, 2)).copy()
+
+    # Same freq grid: return as-is
+    if n_sf == n_tf and sol_freqs is not None and np.allclose(sol_freqs, target_freqs):
         return j_interp
 
-    # Freq handling
-    if j_interp.ndim == 4:
-        # (n_t, n_ant, 2, 2) — broadcast to freq
-        n_t, n_ant = j_interp.shape[:2]
-        return np.broadcast_to(
-            j_interp[:, :, None, :, :],
-            (n_t, n_ant, len(target_freqs), 2, 2)).copy()
-
-    if sol_freqs is not None and j_interp.ndim == 5:
-        # (n_t, n_ant, n_sol_f, 2, 2) — interp to target_freqs
-        n_t, n_ant, n_sf = j_interp.shape[:3]
-        n_tf = len(target_freqs)
-        if n_sf == n_tf and np.allclose(sol_freqs, target_freqs):
-            return j_interp
-        # Nearest freq interp
+    # Different freq grids: nearest freq interp
+    if sol_freqs is not None:
         idx = np.argmin(np.abs(sol_freqs[:, None] - target_freqs[None, :]), axis=0)
         return j_interp[:, :, idx]
 
@@ -171,10 +177,35 @@ def interpolate_jones(sol_times, sol_freqs, sol_jones,
 # Multi-field interpolation
 # -------------------------------------------------------------------
 
+def _sol_n_freq(fd):
+    """Number of solution freq channels from a field_data entry."""
+    j = fd["jones"]
+    if j.ndim == 5:
+        return j.shape[1]  # (n_ant, n_freq, n_time, 2, 2)
+    if j.ndim == 4:
+        return 1  # no freq axis
+    return j.shape[2] if j.ndim >= 3 else 1
+
+
+def _log_interp(jones_label, chosen_fields, target_field, method,
+                time_interp, n_sol_times, n_target_times,
+                n_sol_freq, sol_freqs, target_freqs):
+    """Log one line: which field, why, and how interpolation works."""
+    if not jones_label:
+        return
+    freq_desc = _freq_interp_desc(n_sol_freq, sol_freqs, target_freqs)
+    src = "+".join(chosen_fields) if isinstance(chosen_fields, list) else chosen_fields
+    logger.info(
+        f"    {jones_label}: {src} -> {target_field}  "
+        f"({method}, time={time_interp} {n_sol_times}->{n_target_times}, "
+        f"freq={freq_desc})")
+
+
 def interpolate_jones_multifield(
     fields_data, target_times, target_freqs,
     field_select, time_interp,
     target_ra=None, target_dec=None, pinned_fields=None,
+    jones_label="", target_field="",
 ):
     """Select field and interpolate.
 
@@ -183,6 +214,8 @@ def interpolate_jones_multifield(
     """
     if not fields_data:
         raise ValueError("fields_data empty")
+
+    n_tt = len(target_times)
 
     if field_select == "nearest_sky":
         if target_ra is None:
@@ -194,6 +227,9 @@ def interpolate_jones_multifield(
             if dirs:
                 chosen = select_field_nearest_sky(dirs, target_ra, target_dec)
                 fd = fields_data[chosen]
+                _log_interp(jones_label, chosen, target_field, "nearest_sky",
+                            time_interp, len(fd["times"]), n_tt,
+                            _sol_n_freq(fd), fd.get("freqs"), target_freqs)
                 return interpolate_jones(
                     fd["times"], fd.get("freqs"), fd["jones"],
                     target_times, target_freqs, time_interp)
@@ -205,9 +241,22 @@ def interpolate_jones_multifield(
         ufields = list(dict.fromkeys(fft))
         if len(ufields) == 1:
             fd = fields_data[ufields[0]]
+            _log_interp(jones_label, ufields[0], target_field, "nearest_time",
+                        time_interp, len(fd["times"]), n_tt,
+                        _sol_n_freq(fd), fd.get("freqs"), target_freqs)
             return interpolate_jones(
                 fd["times"], fd.get("freqs"), fd["jones"],
                 target_times, target_freqs, time_interp)
+        # Multiple fields contribute different time ranges
+        parts = []
+        for fn in ufields:
+            cnt = int((fft == fn).sum())
+            parts.append(f"{fn}({cnt}t)")
+        fd0 = fields_data[ufields[0]]
+        _log_interp(jones_label, parts, target_field, "nearest_time",
+                    time_interp,
+                    sum(len(fields_data[fn]["times"]) for fn in ufields),
+                    n_tt, _sol_n_freq(fd0), fd0.get("freqs"), target_freqs)
         result = None
         for fn in ufields:
             mask = fft == fn
@@ -228,6 +277,9 @@ def interpolate_jones_multifield(
             if fn not in fields_data:
                 raise ValueError(f"Pinned field {fn!r} not found")
             fd = fields_data[fn]
+            _log_interp(jones_label, fn, target_field, "pinned",
+                        time_interp, len(fd["times"]), n_tt,
+                        _sol_n_freq(fd), fd.get("freqs"), target_freqs)
             results.append(interpolate_jones(
                 fd["times"], fd.get("freqs"), fd["jones"],
                 target_times, target_freqs, time_interp))

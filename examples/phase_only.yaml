@@ -1,0 +1,33 @@
+# Phase-only gain calibration
+#
+# Useful when amplitude calibration is unreliable or unnecessary.
+# phase_only: true fixes the gain amplitude to 1.0 and only solves
+# for the phase.
+#
+# G0: bandpass phases (freq-dependent, phase-only)
+# G1: time-variable phases (2 min bins, phase-only)
+
+solve:
+  - ms: calibrators.ms
+    output: cal.h5
+    ref_ant: C04
+    solver_backend: ceres
+
+    jones: [K, G, G]
+    field:
+      - [3C286]
+      - [3C286]
+      - [3C286]
+    time_interval: [scan, inf, 2min]
+    freq_interval: [full, 4MHz, full]
+    phase_only:    [false, true, true]
+    preapply_time_interp: [exact, nearest, nearest]
+
+apply:
+  - ms: science.ms
+    output_col: CORRECTED_DATA
+
+    jones:  [K0, G0, G1]
+    tables: [cal.h5, cal.h5, cal.h5]
+    field_select: nearest_time
+    time_interp: [nearest, nearest, linear]

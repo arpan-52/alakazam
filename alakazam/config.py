@@ -27,7 +27,7 @@ import yaml
 # ---------------------------------------------------------------------------
 
 VALID_JONES = {"K", "G", "D", "KC", "CP"}
-VALID_BACKENDS = {"jax", "scipy"}
+VALID_BACKENDS = {"ceres", "jax", "scipy"}
 VALID_TIME_INTERP = {"exact", "nearest", "linear", "cubic"}
 VALID_FIELD_SELECT = {"nearest_time", "nearest_sky", "pinned"}
 
@@ -324,7 +324,7 @@ class SolveBlock:
     tol: float = 1e-10
     memory_limit_gb: float = 0.0
 
-    solver_backend: str = "jax"
+    solver_backend: str = "ceres"
     n_workers: int = 0          # 0 = auto
     gpu: bool = False           # auto-detect; True = force GPU
 
@@ -458,7 +458,7 @@ def _parse_solve_block(d: Dict[str, Any]) -> SolveBlock:
                 f"Valid: {sorted(VALID_TIME_INTERP)}")
 
     # Solver backend
-    backend = d.get("solver_backend", "jax")
+    backend = d.get("solver_backend", "ceres")
     _validate_backend(backend)
 
     # External preapply

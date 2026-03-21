@@ -218,24 +218,15 @@ def is_diagonal_jones(J):
 
 
 def unapply_jones_to_rows(J, vis, ant1, ant2):
-    """Smart dispatch: diagonal-optimized or full 2x2.
+    """Dispatch: diagonal-optimized or full 2x2.
 
-    J: (n_ant, 2, 2) or (n_ant, n_freq, 2, 2)
+    J: (n_ant, n_freq, 2, 2) — always 4D.
     vis: (n_row, n_chan, 2, 2)
     """
-    diag = is_diagonal_jones(J)
-    if J.ndim == 3:
-        if diag:
-            return unapply_rows_diag(J, vis, ant1, ant2)
-        else:
-            return unapply_rows_full(J, vis, ant1, ant2)
-    elif J.ndim == 4:
-        if diag:
-            return unapply_rows_diag_freqdep(J, vis, ant1, ant2)
-        else:
-            return unapply_rows_full_freqdep(J, vis, ant1, ant2)
+    if is_diagonal_jones(J):
+        return unapply_rows_diag_freqdep(J, vis, ant1, ant2)
     else:
-        raise ValueError(f"J has unexpected ndim={J.ndim}")
+        return unapply_rows_full_freqdep(J, vis, ant1, ant2)
 
 
 # -------------------------------------------------------------------
@@ -344,42 +335,42 @@ def compute_residual_cross_freq(J, vis_obs, vis_model, ant1, ant2):
 # Chain composition — compose list of per-antenna Jones
 # -------------------------------------------------------------------
 
+def _ensure_4d(J):
+    """(n_ant, 2, 2) -> (n_ant, 1, 2, 2). Already 4D? pass through."""
+    if J.ndim == 3:
+        return J[:, np.newaxis, :, :]
+    return J
+
+
 def compose_jones_chain(jones_list: List[np.ndarray]) -> Optional[np.ndarray]:
     """Compose [J1, J2, ..., JN] -> J_total = J_N ... J_2 J_1.
 
-    Each J can be (n_ant, 2, 2) or (n_ant, n_freq, 2, 2).
-    Mixed dims: freq-indep broadcasts to freq-dep.
+    Each J is (n_ant, n_freq, 2, 2) or (n_ant, 2, 2).
+    3D inputs are broadcast to match any 4D input's freq axis.
+    Output is always 4D (n_ant, n_freq, 2, 2).
     """
     if not jones_list:
         return None
 
-    result = jones_list[0].copy()
+    # Find max freq dim
+    n_freq = 1
+    for J in jones_list:
+        if J.ndim == 4 and J.shape[1] > n_freq:
+            n_freq = J.shape[1]
+
+    # Broadcast all to (n_ant, n_freq, 2, 2)
+    def _broadcast(J):
+        J = _ensure_4d(J)
+        if J.shape[1] == 1 and n_freq > 1:
+            return np.broadcast_to(J, (J.shape[0], n_freq, 2, 2)).copy()
+        return J
+
+    result = _broadcast(jones_list[0])
     for J in jones_list[1:]:
-        r_nd = result.ndim
-        j_nd = J.ndim
-
-        if r_nd == 3 and j_nd == 3:
-            result = jones_multiply(J, result)
-
-        elif r_nd == 4 and j_nd == 4:
-            n_ant, n_freq = result.shape[:2]
-            out = np.empty_like(result)
-            for f in range(n_freq):
-                out[:, f] = jones_multiply(J[:, f], result[:, f])
-            result = out
-
-        elif r_nd == 3 and j_nd == 4:
-            n_ant, n_freq = J.shape[:2]
-            out = np.empty_like(J)
-            for f in range(n_freq):
-                out[:, f] = jones_multiply(J[:, f], result)
-            result = out
-
-        elif r_nd == 4 and j_nd == 3:
-            n_ant, n_freq = result.shape[:2]
-            out = np.empty_like(result)
-            for f in range(n_freq):
-                out[:, f] = jones_multiply(J, result[:, f])
-            result = out
+        J = _broadcast(J)
+        out = np.empty_like(result)
+        for f in range(n_freq):
+            out[:, f] = jones_multiply(J[:, f], result[:, f])
+        result = out
 
     return result

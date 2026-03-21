@@ -1,0 +1,34 @@
+# Pinned field selection: explicitly map calibrator solutions to target
+#
+# Use case: you know exactly which calibrator's solutions should apply
+# to which target field. No automatic nearest_time/nearest_sky logic.
+#
+# solution_field specifies which solved field(s) to use for each term.
+# If multiple fields are listed, their Jones are averaged (not recommended
+# unless you know what you're doing).
+#
+# Here: apply 3C286's K and J0630's G to all science targets.
+
+solve:
+  - ms: calibrators.ms
+    output: cal.h5
+    ref_ant: C04
+    solver_backend: ceres
+
+    jones: [K, G]
+    field:
+      - [3C286]              # K: only 3C286
+      - [3C286, J0630]       # G: both calibrators
+    time_interval: [scan, 2min]
+    freq_interval: [full, full]
+    preapply_time_interp: [exact, nearest]
+
+apply:
+  - ms: science.ms
+    output_col: CORRECTED_DATA
+
+    jones:          [K0,       G0      ]
+    tables:         [cal.h5,   cal.h5  ]
+    field_select:   [pinned,   pinned  ]
+    time_interp:    [nearest,  linear  ]
+    solution_field: [[3C286],  [J0630] ]

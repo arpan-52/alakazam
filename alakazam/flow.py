@@ -107,11 +107,12 @@ def _run_solve_block(sb: SolveBlock) -> None:
     _log(f"  Reference antenna: {meta.ant_names[sb.ref_ant]} (index {ref_remapped})")
 
     device = detect_device(sb.solver_backend, sb.gpu)
-    _log(f"  Backend: {sb.solver_backend}  Device: {device}")
+    _dev_style = "bold green" if device == "gpu" else "yellow"
+    _log(f"  Backend: {sb.solver_backend}  Device: {device}", _dev_style)
 
     # Detect feed basis once for the whole solve block
     feed_basis = detect_feed_basis(sb.ms)
-    _log(f"  Feed basis: {feed_basis.value}")
+    _log(f"  Feed basis: {feed_basis.value}", "dim")
 
     global_spws = spw_ids_from_selection(sb.spw)
     if global_spws is None: global_spws = list(range(meta.n_spw))
@@ -172,7 +173,8 @@ def _run_solve_block(sb: SolveBlock) -> None:
                 _solve_one_field(sb, step_idx, jones_key, fn, fscans,
                                  spw, freqs, chan_sl, meta, solver,
                                  internal_stack, n_active, ant_remap,
-                                 active_names, jones_keys, feed_basis)
+                                 active_ants, active_names, jones_keys,
+                                 feed_basis)
 
             fields = load_all_fields(sb.output, jones_key, spw)
             if jones_key not in internal_stack: internal_stack[jones_key] = {}
@@ -186,8 +188,8 @@ def _run_solve_block(sb: SolveBlock) -> None:
 
 def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
                      spw, freqs, chan_sl, meta, solver, internal_stack,
-                     n_active, ant_remap, active_names, jones_keys,
-                     feed_basis):
+                     n_active, ant_remap, active_ants, active_names,
+                     jones_keys, feed_basis):
     """Load raw -> flag -> average -> convert 2x2 -> parang/preapply at t_mid -> solve.
     jones_type is the unique key (K0, G0, G1, etc)."""
     n_ant = n_active
@@ -213,7 +215,7 @@ def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
     n_freq = len(freq_bins)
 
     if n_time == 0: return
-    _log(f"        Solve grid: {n_freq} freq x {n_time} time = {n_freq*n_time} cells  ({total_rows} rows)")
+    _log(f"        Solve grid: {n_freq} freq x {n_time} time = {n_freq*n_time} cells  ({total_rows} rows)", "dim")
 
     # ---- 2. MEMORY STRATEGY ----
     bytes_per_row = n_chan * meta.n_corr * 33  # obs(c128) + model(c128) + flags(bool)
@@ -236,13 +238,14 @@ def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
         tier = 3
 
     _log(f"        Memory strategy: Tier {tier}  "
-         f"(budget {avail_bytes/1e9:.1f} GB, data {total_data_bytes/1e9:.2f} GB)")
+         f"(budget {avail_bytes/1e9:.1f} GB, data {total_data_bytes/1e9:.2f} GB)", "dim")
 
     # ---- 3. PRECOMPUTE PREAPPLY at t_mid (tiny) ----
     time_centres = np.array([float(np.mean(tb)) for tb in time_bins])
     preapply_at_tmid = _compute_preapply_at_tmids(
         sb, step_idx, field_name, spw, freqs, time_centres, meta, internal_stack,
-        jones_keys=jones_keys, feed_basis=feed_basis)
+        jones_keys=jones_keys, feed_basis=feed_basis,
+        active_ants=active_ants)
 
     # ---- 4. ALLOCATE OUTPUT ----
     jones_grid = np.full((n_ant, n_freq, n_time, 2, 2), np.nan+0j, dtype=np.complex128)
@@ -412,10 +415,10 @@ def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
     n_total = conv_grid.size
     n_flag = int(sol_flags.sum())
     scans_str = ",".join(str(s) for s in sorted(scan_groups.keys()))
-    _log(f"        Flagged {n_flag}/{sol_flags.size} solution slots")
-    _log(f"        Solved {n_conv}/{n_total} cells converged")
+    _log(f"        Flagged {n_flag}/{sol_flags.size} solution slots", "yellow")
+    _log(f"        Converged {n_conv}/{n_total} cells", "green" if n_conv == n_total else "red")
     _log(f"        Saved {jones_type}/{field_name}/scan_[{scans_str}]/spw_{spw} -> {sb.output}  "
-         f"({n_ant} ant x {n_freq} freq x {n_time} time)")
+         f"({n_ant} ant x {n_freq} freq x {n_time} time)", "cyan")
 
 
 # ============================================================
@@ -447,7 +450,7 @@ def _solve_tasks(tasks, solver, n_ant, n_workers,
         cost_grid[fi, ti] = r.get("cost", 0.0)
 
     n_tasks = len(tasks)
-    _log(f"        Solving {n_tasks} cell(s)...")
+    _log(f"        Solving {n_tasks} cell(s)...", "bold blue")
 
     if n_workers > 1 and n_tasks > 1:
         with ThreadPoolExecutor(max_workers=n_workers) as pool:
@@ -465,18 +468,28 @@ def _solve_tasks(tasks, solver, n_ant, n_workers,
 def _unapply_on_averaged(J_pre, avg_vis, bl_a1, bl_a2):
     """Correct averaged data: V_corr = J_i^{-1} V J_j^{-H}.
 
-    J_pre and avg_vis must have matching dimensions.
-    J: (n_ant, 2, 2) for freq-averaged cells
+    J: (n_ant, 2, 2) or (n_ant, n_freq, 2, 2)
     vis: (n_bl, 2, 2) or (n_bl, n_chan, 2, 2)
 
-    For freq-averaged vis (n_bl, 2, 2), add dummy chan dim for numba kernel.
+    Ensures J and vis freq axes match for the numba kernel.
     """
     if avg_vis.ndim == 3:
-        # (n_bl, 2, 2) -> add dummy chan -> (n_bl, 1, 2, 2)
-        out = unapply_jones_to_rows(
-            J_pre, avg_vis[:, None, :, :], bl_a1, bl_a2)
-        return out[:, 0]  # back to (n_bl, 2, 2)
-    return unapply_jones_to_rows(J_pre, avg_vis, bl_a1, bl_a2)
+        avg_vis = avg_vis[:, np.newaxis, :, :]
+        squeeze = True
+    else:
+        squeeze = False
+    if J_pre.ndim == 3:
+        J_pre = J_pre[:, np.newaxis, :, :]
+    # Match freq dims
+    n_chan_vis = avg_vis.shape[1]
+    n_chan_j = J_pre.shape[1]
+    if n_chan_j == 1 and n_chan_vis > 1:
+        J_pre = np.broadcast_to(
+            J_pre, (J_pre.shape[0], n_chan_vis, 2, 2)).copy()
+    elif n_chan_j > 1 and n_chan_vis == 1:
+        J_pre = J_pre.mean(axis=1, keepdims=True)
+    out = unapply_jones_to_rows(J_pre, avg_vis, bl_a1, bl_a2)
+    return out[:, 0] if squeeze else out
 
 
 def _build_cells_from_raw(vis_raw, mod_raw, fl_raw, a1r, a2r,
@@ -544,9 +557,10 @@ def _compute_rows_per_tbin(row_times_all, time_bins):
 
 def _compute_preapply_at_tmids(sb, step_idx, field_name, spw, freqs,
                                 time_centres, meta, internal_stack,
-                                jones_keys=None, feed_basis=None):
+                                jones_keys=None, feed_basis=None,
+                                active_ants=None):
     """Compute composed preapply Jones at each t_mid.
-    Returns list of (n_ant, 2, 2) or None per time_bin."""
+    Returns list of (n_active_ant, 2, 2) or None per time_bin."""
     # No preapply needed for step 0 without parang or external
     has_parang = sb.apply_parang
     has_external = sb.external_preapply is not None
@@ -580,7 +594,9 @@ def _compute_preapply_at_tmids(sb, step_idx, field_name, spw, freqs,
                 fb = feed_basis if feed_basis is not None else detect_feed_basis(sb.ms)
                 pa = compute_parallactic_angles(
                     sb.ms, np.array([t_mid]), field=field_name)
-                P = parang_to_jones(pa[0], fb)
+                P = parang_to_jones(pa[0], fb)  # (n_ant_full, 2, 2)
+                if active_ants is not None:
+                    P = P[active_ants]  # (n_active, 2, 2)
                 jones_list.append(P)
             except Exception as e:
                 logger.warning(f"      parang failed: {e}")
@@ -598,12 +614,8 @@ def _compute_preapply_at_tmids(sb, step_idx, field_name, spw, freqs,
                     J = interpolate_jones_multifield(
                         fmt, np.array([t_mid]), freqs, efs, eti,
                         target_ra=tgt_ra, target_dec=tgt_dec, pinned_fields=epf)
-                    if J is not None and J.ndim >= 3:
-                        Jt = J[0]  # (n_ant, [n_f,] 2, 2)
-                        # Collapse freq if present -> always (n_ant, 2, 2)
-                        if Jt.ndim == 4:
-                            Jt = Jt.mean(axis=1)
-                        jones_list.append(Jt)
+                    if J is not None:
+                        jones_list.append(J[0])  # (n_ant, n_freq, 2, 2)
                 except Exception as e:
                     logger.warning(f"      external preapply failed: {e}")
 
@@ -619,11 +631,8 @@ def _compute_preapply_at_tmids(sb, step_idx, field_name, spw, freqs,
                         fmt, np.array([t_mid]), freqs, "nearest_time",
                         sb.preapply_time_interp[pi],
                         target_ra=tgt_ra, target_dec=tgt_dec)
-                    if J is not None and J.ndim >= 3:
-                        Jt = J[0]
-                        if Jt.ndim == 4:
-                            Jt = Jt.mean(axis=1)
-                        jones_list.append(Jt)
+                    if J is not None:
+                        jones_list.append(J[0])  # (n_ant, n_freq, 2, 2)
                 except Exception as e:
                     logger.warning(f"      internal preapply failed: {e}")
 

@@ -29,6 +29,17 @@ from ..config import FluxscaleBlock, spw_ids_from_selection
 
 logger = logging.getLogger("alakazam")
 
+try:
+    from rich.console import Console
+    _con = Console()
+except ImportError:
+    _con = None
+
+def _log(msg, style=""):
+    logger.info(msg)
+    if _con and style: _con.print(msg, style=style)
+    elif _con: _con.print(msg)
+
 
 def compute_scale(
     g_ref: np.ndarray,
@@ -138,13 +149,13 @@ def run_fluxscale(fb: FluxscaleBlock) -> None:
     else:
         copy_solutions(fb.transfer_table, output)
 
-    logger.info(f"  Jones type: {jones_type}")
-    logger.info(f"  Reference: {fb.reference_field} from {fb.reference_table}")
-    logger.info(f"  Transfer:  {fb.transfer_field} from {fb.transfer_table}")
+    _log(f"  Jones type: {jones_type}", "bold cyan")
+    _log(f"  Reference: {fb.reference_field} from {fb.reference_table}", "dim")
+    _log(f"  Transfer:  {fb.transfer_field} from {fb.transfer_table}", "dim")
 
     for ref_field in fb.reference_field:
         for trn_field in fb.transfer_field:
-            logger.info(f"  Bootstrapping: {ref_field} -> {trn_field}")
+            _log(f"  Bootstrapping: {ref_field} -> {trn_field}", "bold")
 
             for spw in spws:
                 try:
@@ -159,9 +170,9 @@ def run_fluxscale(fb: FluxscaleBlock) -> None:
                 sp, sq, scp, scq, n_ant = compute_scale(
                     ref_data["jones"], trn_data["jones"])
 
-                logger.info(f"    SPW {spw}: scale_p={sp:.4f} scale_q={sq:.4f} "
-                            f"(scatter: {scp:.4f}, {scq:.4f}) "
-                            f"using {n_ant} antennas")
+                _log(f"    SPW {spw}: scale_p={sp:.4f} scale_q={sq:.4f} "
+                     f"(scatter: {scp:.4f}, {scq:.4f}) "
+                     f"using {n_ant} antennas", "green")
 
                 rescale_solutions(output, jones_type, trn_field,
                                   spw, sp, sq)
@@ -177,4 +188,4 @@ def run_fluxscale(fb: FluxscaleBlock) -> None:
                     jones_type=jones_type,
                 )
 
-    logger.info(f"  Fluxscale saved to {output}")
+    _log(f"  Fluxscale saved to {output}", "bold green")
