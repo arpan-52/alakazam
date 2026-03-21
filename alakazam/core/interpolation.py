@@ -117,6 +117,59 @@ def _interp_time(sol_times, sol_data, target_times, mode):
 
 
 # -------------------------------------------------------------------
+# Delay interpolation — reconstruct Jones at target frequencies
+# -------------------------------------------------------------------
+
+def interpolate_delay(sol_times, sol_delay, target_times, target_freqs, time_interp):
+    """Interpolate delay values in time, then reconstruct Jones at target freqs.
+
+    sol_delay: (n_ant, n_freq, n_time, 2) — delay in nanoseconds (HDF5 schema)
+    Returns:   (n_target_t, n_ant, n_target_f, 2, 2) — always 5D Jones.
+
+    The delay is real-valued, so interpolation is straightforward (no amp/phase).
+    Jones reconstruction: J[a,f,p,p] = exp(-2pi*i * delay[a,p] * 1e-9 * freq[f])
+    """
+    # Transpose to (n_time, n_ant, n_freq, 2) for time interp
+    d = sol_delay.transpose(2, 0, 1, 3)  # (n_time, n_ant, n_freq, 2)
+
+    # Time interpolation on real-valued delays
+    n_sol_t = d.shape[0]
+    n_tt = len(target_times)
+    if time_interp in ("exact", "nearest") or n_sol_t < 2:
+        idx = np.argmin(np.abs(sol_times[:, None] - target_times[None, :]), axis=0)
+        d_interp = d[idx]  # (n_tt, n_ant, n_freq, 2)
+    elif time_interp == "linear":
+        tc = np.clip(target_times, sol_times[0], sol_times[-1])
+        shape = d.shape[1:]
+        flat = d.reshape(n_sol_t, -1)
+        out = np.empty((n_tt, flat.shape[1]), dtype=np.float64)
+        for k in range(flat.shape[1]):
+            out[:, k] = np.interp(tc, sol_times, flat[:, k])
+        d_interp = out.reshape((n_tt,) + shape)
+    else:
+        idx = np.argmin(np.abs(sol_times[:, None] - target_times[None, :]), axis=0)
+        d_interp = d[idx]
+
+    # d_interp: (n_tt, n_ant, n_freq_sol, 2)
+    # Average across solution freq bins (delay is same physical quantity per bin)
+    delay_avg = np.mean(d_interp, axis=2)  # (n_tt, n_ant, 2)
+
+    # Reconstruct Jones at every target frequency
+    n_ant = delay_avg.shape[1]
+    n_tf = len(target_freqs)
+    J = np.zeros((n_tt, n_ant, n_tf, 2, 2), dtype=np.complex128)
+    # delay_avg[:,:,0] = tau_p, delay_avg[:,:,1] = tau_q  (nanoseconds)
+    # phase = -2*pi * tau_ns * 1e-9 * freq_hz
+    twopi = 2.0 * np.pi * 1e-9
+    for p in range(2):
+        # (n_tt, n_ant, 1) * (1, 1, n_tf) -> (n_tt, n_ant, n_tf)
+        phase = -twopi * delay_avg[:, :, p:p+1] * target_freqs[np.newaxis, np.newaxis, :]
+        J[:, :, :, p, p] = np.exp(1j * phase)
+
+    return J
+
+
+# -------------------------------------------------------------------
 # Single-field interpolation
 # -------------------------------------------------------------------
 
@@ -177,6 +230,16 @@ def interpolate_jones(sol_times, sol_freqs, sol_jones,
 # Multi-field interpolation
 # -------------------------------------------------------------------
 
+def _interpolate_field(fd, target_times, target_freqs, time_interp):
+    """Interpolate a single field's data. Uses delay reconstruction if available."""
+    if fd.get("delay") is not None:
+        return interpolate_delay(
+            fd["times"], fd["delay"], target_times, target_freqs, time_interp)
+    return interpolate_jones(
+        fd["times"], fd.get("freqs"), fd["jones"],
+        target_times, target_freqs, time_interp)
+
+
 def _sol_n_freq(fd):
     """Number of solution freq channels from a field_data entry."""
     j = fd["jones"]
@@ -189,11 +252,14 @@ def _sol_n_freq(fd):
 
 def _log_interp(jones_label, chosen_fields, target_field, method,
                 time_interp, n_sol_times, n_target_times,
-                n_sol_freq, sol_freqs, target_freqs):
+                n_sol_freq, sol_freqs, target_freqs, has_delay=False):
     """Log one line: which field, why, and how interpolation works."""
     if not jones_label:
         return
-    freq_desc = _freq_interp_desc(n_sol_freq, sol_freqs, target_freqs)
+    if has_delay:
+        freq_desc = f"delay->jones {len(target_freqs)}ch"
+    else:
+        freq_desc = _freq_interp_desc(n_sol_freq, sol_freqs, target_freqs)
     src = "+".join(chosen_fields) if isinstance(chosen_fields, list) else chosen_fields
     logger.info(
         f"    {jones_label}: {src} -> {target_field}  "
@@ -229,10 +295,9 @@ def interpolate_jones_multifield(
                 fd = fields_data[chosen]
                 _log_interp(jones_label, chosen, target_field, "nearest_sky",
                             time_interp, len(fd["times"]), n_tt,
-                            _sol_n_freq(fd), fd.get("freqs"), target_freqs)
-                return interpolate_jones(
-                    fd["times"], fd.get("freqs"), fd["jones"],
-                    target_times, target_freqs, time_interp)
+                            _sol_n_freq(fd), fd.get("freqs"), target_freqs,
+                            has_delay=fd.get("delay") is not None)
+                return _interpolate_field(fd, target_times, target_freqs, time_interp)
             field_select = "nearest_time"
 
     if field_select == "nearest_time":
@@ -243,10 +308,9 @@ def interpolate_jones_multifield(
             fd = fields_data[ufields[0]]
             _log_interp(jones_label, ufields[0], target_field, "nearest_time",
                         time_interp, len(fd["times"]), n_tt,
-                        _sol_n_freq(fd), fd.get("freqs"), target_freqs)
-            return interpolate_jones(
-                fd["times"], fd.get("freqs"), fd["jones"],
-                target_times, target_freqs, time_interp)
+                        _sol_n_freq(fd), fd.get("freqs"), target_freqs,
+                        has_delay=fd.get("delay") is not None)
+            return _interpolate_field(fd, target_times, target_freqs, time_interp)
         # Multiple fields contribute different time ranges
         parts = []
         for fn in ufields:
@@ -256,14 +320,13 @@ def interpolate_jones_multifield(
         _log_interp(jones_label, parts, target_field, "nearest_time",
                     time_interp,
                     sum(len(fields_data[fn]["times"]) for fn in ufields),
-                    n_tt, _sol_n_freq(fd0), fd0.get("freqs"), target_freqs)
+                    n_tt, _sol_n_freq(fd0), fd0.get("freqs"), target_freqs,
+                    has_delay=fd0.get("delay") is not None)
         result = None
         for fn in ufields:
             mask = fft == fn
             fd = fields_data[fn]
-            sub = interpolate_jones(
-                fd["times"], fd.get("freqs"), fd["jones"],
-                target_times[mask], target_freqs, time_interp)
+            sub = _interpolate_field(fd, target_times[mask], target_freqs, time_interp)
             if result is None:
                 result = np.empty((len(target_times),) + sub.shape[1:], dtype=np.complex128)
             result[mask] = sub
@@ -279,10 +342,9 @@ def interpolate_jones_multifield(
             fd = fields_data[fn]
             _log_interp(jones_label, fn, target_field, "pinned",
                         time_interp, len(fd["times"]), n_tt,
-                        _sol_n_freq(fd), fd.get("freqs"), target_freqs)
-            results.append(interpolate_jones(
-                fd["times"], fd.get("freqs"), fd["jones"],
-                target_times, target_freqs, time_interp))
+                        _sol_n_freq(fd), fd.get("freqs"), target_freqs,
+                        has_delay=fd.get("delay") is not None)
+            results.append(_interpolate_field(fd, target_times, target_freqs, time_interp))
         if len(results) == 1:
             return results[0]
         return np.mean(np.stack(results), axis=0)

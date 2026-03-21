@@ -249,6 +249,7 @@ def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
 
     # ---- 4. ALLOCATE OUTPUT ----
     jones_grid = np.full((n_ant, n_freq, n_time, 2, 2), np.nan+0j, dtype=np.complex128)
+    delay_grid = np.zeros((n_ant, n_freq, n_time, 2), dtype=np.float64) if freq_dep else None
     conv_grid = np.zeros((n_freq, n_time), dtype=bool)
     niter_grid = np.zeros((n_freq, n_time), dtype=np.int32)
     cost_grid = np.zeros((n_freq, n_time), dtype=np.float64)
@@ -356,7 +357,8 @@ def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
 
         # SOLVE
         _solve_tasks(tasks, solver, n_ant, n_workers,
-                     jones_grid, conv_grid, niter_grid, cost_grid)
+                     jones_grid, conv_grid, niter_grid, cost_grid,
+                     delay_grid=delay_grid)
         del tasks; gc.collect()
 
     # ---- 6. FLAG + SAVE (per scan) ----
@@ -403,6 +405,7 @@ def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
             flags=sol_flags[:, :, idx],
             times=time_centres[idx],
             freqs=freq_centres,
+            delay=delay_grid[:, :, idx] if delay_grid is not None else None,
             solver_stats={"converged": conv_grid[:, idx],
                           "n_iter": niter_grid[:, idx],
                           "cost": cost_grid[:, idx]},
@@ -426,7 +429,8 @@ def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
 # ============================================================
 
 def _solve_tasks(tasks, solver, n_ant, n_workers,
-                 jones_grid, conv_grid, niter_grid, cost_grid):
+                 jones_grid, conv_grid, niter_grid, cost_grid,
+                 delay_grid=None):
     """Dispatch tasks to solver, fill grids."""
     import time as _t
 
@@ -448,6 +452,8 @@ def _solve_tasks(tasks, solver, n_ant, n_workers,
         conv_grid[fi, ti] = r.get("converged", False)
         niter_grid[fi, ti] = r.get("n_iter", 0)
         cost_grid[fi, ti] = r.get("cost", 0.0)
+        if delay_grid is not None and "delay" in r:
+            delay_grid[:, fi, ti] = r["delay"]
 
     n_tasks = len(tasks)
     _log(f"        Solving {n_tasks} cell(s)...", "bold blue")
