@@ -13,11 +13,19 @@ Memory-aware batching: loads groups of time_bins that fit in RAM.
 Each batch: load -> flag -> average -> free raw -> solve -> store.
 
 Developed by Arpan Pal 2026, NRAO / NCRA
+
+I have learnt some of the quite interesting aspects while developing this sucker. In a quite reasonable shape now.
+
+CERES is the show-stopper, do I want a solver with no external control or use the state of the art from Google? For now, let's stick with Ceres, seems fast, accurate and built for sparse non-linear least sqaure problems.
+
+The future is definitely not scipy, is it Ceres? or if I write a sparse alegbric solver, I will try the GPU one.
+
+Cheers. \/ \/ n
 """
 
 from __future__ import annotations
 import gc, json, logging, os, time as _time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 import numpy as np
 
@@ -41,6 +49,60 @@ from .jones.algebra import (compose_jones_chain, unapply_jones_to_rows,
                             detect_feed_basis, FeedBasis)
 
 logger = logging.getLogger("alakazam")
+
+try:
+    import psutil as _psutil
+    _HAVE_PSUTIL = True
+except ImportError:
+    _HAVE_PSUTIL = False
+
+# Cache: (n_chan, n_corr) -> measured bytes-per-row.
+# RSS delta is only measurable on the first probe (glibc reuses mapped
+# pages on later calls so delta stays zero). Cache the first valid
+# measurement and reuse it when subsequent probes return zero.
+_bpr_cache: dict = {}
+
+
+def _probe_bytes_per_row(ms_path, spw, fields, scans, data_col, model_col,
+                         chan_sl, first_time, n_chan, n_corr):
+    """Read exactly one timestamp, measure RSS delta -> bytes-per-row.
+    Caches first valid measurement per (n_chan, n_corr) because glibc
+    memory reuse makes subsequent probes return delta=0."""
+    cache_key = (n_chan, n_corr)
+    numpy_floor = n_chan * n_corr * 33  # obs(c128) + model(c128) + flags(bool)
+
+    t_lo = float(first_time) - 0.01
+    t_hi = float(first_time) + 0.01
+
+    if _HAVE_PSUTIL:
+        proc = _psutil.Process()
+        rss_before = proc.memory_info().rss
+
+    d = read_data(ms_path, spw, fields=fields, scans=scans,
+                  data_col=data_col, model_col=model_col,
+                  chan_slice=chan_sl, time_range=(t_lo, t_hi),
+                  need_rowids=False)
+    if not d:
+        return _bpr_cache.get(cache_key, numpy_floor)
+
+    n_rows = len(d["ant1"])
+
+    if _HAVE_PSUTIL and n_rows > 0:
+        rss_after = proc.memory_info().rss  # measure while d is still alive
+        delta = rss_after - rss_before
+        del d; gc.collect()
+        if delta > 0:
+            bpr = max(delta // n_rows, numpy_floor)
+            # Keep the maximum ever observed — first clean-process measurement
+            # is most accurate; subsequent probes may have smaller delta due to
+            # glibc page reuse and should not overwrite it.
+            _bpr_cache[cache_key] = max(bpr, _bpr_cache.get(cache_key, 0))
+            return _bpr_cache[cache_key]
+    else:
+        del d; gc.collect()
+
+    # RSS delta was zero (glibc page reuse) — use cached value if available
+    return _bpr_cache.get(cache_key, numpy_floor)
 
 try:
     from rich.console import Console
@@ -218,7 +280,11 @@ def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
     _log(f"        Solve grid: {n_freq} freq x {n_time} time = {n_freq*n_time} cells  ({total_rows} rows)", "dim")
 
     # ---- 2. MEMORY STRATEGY ----
-    bytes_per_row = n_chan * meta.n_corr * 33  # obs(c128) + model(c128) + flags(bool)
+    # Probe-read one timestamp to measure actual RSS cost (casacore + numpy).
+    bytes_per_row = _probe_bytes_per_row(
+        sb.ms, spw, [field_name], field_scans,
+        sb.data_col, sb.model_col, chan_sl,
+        row_times_all[0], n_chan, meta.n_corr)
     avail_bytes = int((sb.memory_limit_gb if sb.memory_limit_gb > 0
                        else get_available_ram_gb() * 0.4) * 1024**3)
     avail_bytes = max(avail_bytes, 100 * 1024**2)
@@ -238,7 +304,8 @@ def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
         tier = 3
 
     _log(f"        Memory strategy: Tier {tier}  "
-         f"(budget {avail_bytes/1e9:.1f} GB, data {total_data_bytes/1e9:.2f} GB)", "dim")
+         f"(budget {avail_bytes/1e9:.1f} GB, data {total_data_bytes/1e9:.2f} GB, "
+         f"{bytes_per_row} B/row)", "dim")
 
     # ---- 3. PRECOMPUTE PREAPPLY at t_mid (tiny) ----
     time_centres = np.array([float(np.mean(tb)) for tb in time_bins])
@@ -269,7 +336,8 @@ def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
             logger.debug(f"        tbin [{ti+1}/{n_time}] {nr} rows — single read")
             d = read_data(sb.ms, spw, fields=[field_name], scans=field_scans,
                           data_col=sb.data_col, model_col=sb.model_col,
-                          chan_slice=chan_sl, time_range=(t_lo, t_hi))
+                          chan_slice=chan_sl, time_range=(t_lo, t_hi),
+                          need_rowids=False)
             if not d: continue
             vis_r, mod_r, fl_r = d["vis_obs"], d["vis_model"], d["flags"]
             a1r = np.array([ant_remap.get(a, a) for a in d["ant1"]], dtype=np.int32)
@@ -301,6 +369,14 @@ def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
                              "count": np.zeros(sh, np.float64),
                              "bl_a1": oa1, "bl_a2": oa2}
 
+            # Get preapply for this time bin (needed before accumulation)
+            J_pre_t3 = None
+            preapply_flagged_t3 = None
+            if preapply_at_tmid is not None and ti < len(preapply_at_tmid):
+                entry = preapply_at_tmid[ti]
+                if entry is not None:
+                    J_pre_t3, preapply_flagged_t3 = entry
+
             unique_t = np.sort(np.unique(tb))
             ci = 0
             while ci < len(unique_t):
@@ -315,7 +391,8 @@ def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
                 ct_hi = float(unique_t[min(ce, len(unique_t)) - 1]) + 0.01
                 d = read_data(sb.ms, spw, fields=[field_name], scans=field_scans,
                               data_col=sb.data_col, model_col=sb.model_col,
-                              chan_slice=chan_sl, time_range=(ct_lo, ct_hi))
+                              chan_slice=chan_sl, time_range=(ct_lo, ct_hi),
+                              need_rowids=False)
                 if d:
                     vr, mr, fr = d["vis_obs"], d["vis_model"], d["flags"]
                     a1r = np.array([ant_remap.get(a, a) for a in d["ant1"]], dtype=np.int32)
@@ -324,6 +401,9 @@ def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
                     vr[fr] = 0.0; mr[fr] = 0.0
                     fr = flag_rfi_raw(vr, fr, sb.rfi_threshold)
                     vr[fr] = 0.0; mr[fr] = 0.0
+                    # Apply preapply at full spectral resolution before accumulating
+                    if J_pre_t3 is not None:
+                        vr = _preapply_raw(J_pre_t3, vr, a1r, a2r)
                     for fi, (_, f_idx) in enumerate(zip(freq_bins, freq_idx_bins)):
                         ac = accum[fi]
                         if freq_dep:
@@ -339,18 +419,21 @@ def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
                     del vr, mr, fr, a1r, a2r; gc.collect()
                 ci = ce
 
-            # Finalize accumulators -> cells
+            # Finalize accumulators -> cells (preapply already applied above)
             tasks = []
             for fi in range(n_freq):
+                # Skip cells where prior solver has no solution
+                if preapply_flagged_t3 is not None and _is_preapply_flagged(preapply_flagged_t3, fi):
+                    tasks.append({"fi": fi, "ti": ti, "vis": None, "model": None,
+                                   "a1": None, "a2": None, "freqs": freq_bins[fi],
+                                   "prior_flagged": True})
+                    continue
+
                 ac = accum[fi]
                 mask = ac["count"] > 0
                 avg_v = np.where(mask, ac["sum_v"] / np.where(mask, ac["count"], 1), 0)
                 avg_m = np.where(mask, ac["sum_m"] / np.where(mask, ac["count"], 1), 0)
                 avg_v_22 = raw_to_2x2(avg_v); avg_m_22 = raw_to_2x2(avg_m)
-                if preapply_at_tmid is not None and ti < len(preapply_at_tmid):
-                    J_pre = preapply_at_tmid[ti]
-                    if J_pre is not None:
-                        avg_v_22 = _unapply_on_averaged(J_pre, avg_v_22, ac["bl_a1"], ac["bl_a2"])
                 tasks.append({"fi": fi, "ti": ti, "vis": avg_v_22, "model": avg_m_22,
                               "a1": ac["bl_a1"], "a2": ac["bl_a2"], "freqs": freq_bins[fi]})
             del accum; gc.collect()
@@ -428,24 +511,44 @@ def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
 # HELPERS
 # ============================================================
 
+def _baseline_valid_fraction(vis):
+    """Fraction of baselines with non-zero data.
+
+    vis: (n_bl, 2, 2) or (n_bl, n_chan, 2, 2).
+    A baseline is 'valid' if any element is nonzero.
+    """
+    if vis.ndim == 4:
+        power = np.abs(vis).sum(axis=(-2, -1, -3))  # (n_bl,)
+    else:
+        power = np.abs(vis).sum(axis=(-2, -1))       # (n_bl,)
+    return float((power > 0).sum()) / max(len(power), 1)
+
+
+_FLAG_THRESHOLD = 0.2  # solve only if >= 20% of baselines are valid
+
+
+def _solve_single_cell(solver, task, n_ant):
+    """Solve one cell — runs in a subprocess (own GIL)."""
+    import time as _t
+    t0 = _t.time()
+    r = solver.solve(
+        vis_obs=task["vis"], vis_model=task["model"],
+        ant1=task["a1"], ant2=task["a2"],
+        freqs=task["freqs"], n_ant=n_ant)
+    r["wall_time"] = _t.time() - t0
+    r["fi"] = task["fi"]
+    r["ti"] = task["ti"]
+    return r
+
+
 def _solve_tasks(tasks, solver, n_ant, n_workers,
                  jones_grid, conv_grid, niter_grid, cost_grid,
                  delay_grid=None):
-    """Dispatch tasks to solver, fill grids."""
-    import time as _t
+    """Dispatch tasks to solver, fill grids.
 
-    def _do(task):
-        t0 = _t.time()
-        r = solver.solve(
-            vis_obs=task["vis"], vis_model=task["model"],
-            ant1=task["a1"], ant2=task["a2"],
-            freqs=task["freqs"], n_ant=n_ant)
-        dt = _t.time() - t0
-        status = "converged" if r.get('converged') else "FAILED"
-        logger.debug(f"          cell ({task['fi']},{task['ti']}): "
-                     f"{status}  iter={r.get('n_iter',0)} "
-                     f"cost={r.get('cost',0):.2e}  {dt:.1f}s")
-        return r
+    Skips cells where >= 80% of baselines are flagged (all-zero).
+    Uses ProcessPoolExecutor for true parallelism (separate GILs).
+    """
 
     def _store(fi, ti, r):
         jones_grid[:, fi, ti] = r["jones"]
@@ -455,20 +558,77 @@ def _solve_tasks(tasks, solver, n_ant, n_workers,
         if delay_grid is not None and "delay" in r:
             delay_grid[:, fi, ti] = r["delay"]
 
-    n_tasks = len(tasks)
-    _log(f"        Solving {n_tasks} cell(s)...", "bold blue")
+    # ---- filter out cells with too much flagged data ----
+    valid_tasks = []
+    n_skipped = 0
+    n_prior_flagged = 0
+    for task in tasks:
+        if task.get("prior_flagged"):
+            n_prior_flagged += 1
+            continue
+        frac = _baseline_valid_fraction(task["vis"])
+        if frac < _FLAG_THRESHOLD:
+            fi, ti = task["fi"], task["ti"]
+            logger.debug(f"          cell ({fi},{ti}): "
+                         f"skipped — {frac*100:.0f}% valid baselines")
+            n_skipped += 1
+        else:
+            valid_tasks.append(task)
 
-    if n_workers > 1 and n_tasks > 1:
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            futs = {pool.submit(_do, t): (t["fi"], t["ti"]) for t in tasks}
+    n_total = len(tasks)
+    n_valid = len(valid_tasks)
+    if n_prior_flagged:
+        _log(f"        Prior flagged {n_prior_flagged}/{n_total} cells (no prior solution)", "yellow")
+    if n_skipped:
+        _log(f"        Skipped {n_skipped}/{n_total} cells (>80% flagged)", "yellow")
+    _log(f"        Solving {n_valid} cell(s)...", "bold blue")
+
+    if n_valid == 0:
+        return
+
+    if n_workers > 1 and n_valid > 1:
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            futs = {pool.submit(_solve_single_cell, solver, t, n_ant):
+                    (t["fi"], t["ti"]) for t in valid_tasks}
             for fut in as_completed(futs):
                 fi, ti = futs[fut]
-                try: _store(fi, ti, fut.result())
-                except Exception as e: logger.error(f"      cell ({fi},{ti}): {e}")
+                try:
+                    r = fut.result()
+                    status = "converged" if r.get('converged') else "FAILED"
+                    logger.debug(f"          cell ({fi},{ti}): "
+                                 f"{status}  iter={r.get('n_iter',0)} "
+                                 f"cost={r.get('cost',0):.2e}  "
+                                 f"{r.get('wall_time',0):.1f}s")
+                    _store(fi, ti, r)
+                except Exception as e:
+                    logger.error(f"      cell ({fi},{ti}): {e}")
     else:
-        for task in tasks:
-            try: _store(task["fi"], task["ti"], _do(task))
-            except Exception as e: logger.error(f"      cell ({task['fi']},{task['ti']}): {e}")
+        for task in valid_tasks:
+            try:
+                r = _solve_single_cell(solver, task, n_ant)
+                status = "converged" if r.get('converged') else "FAILED"
+                logger.debug(f"          cell ({r['fi']},{r['ti']}): "
+                             f"{status}  iter={r.get('n_iter',0)} "
+                             f"cost={r.get('cost',0):.2e}  "
+                             f"{r.get('wall_time',0):.1f}s")
+                _store(r["fi"], r["ti"], r)
+            except Exception as e:
+                logger.error(f"      cell ({task['fi']},{task['ti']}): {e}")
+
+
+def _preapply_raw(J_pre, vis_raw, a1, a2):
+    """Apply preapply correction at full spectral resolution on raw data.
+
+    J_pre: (n_ant, n_freq, 2, 2) — preapply Jones at each channel.
+    vis_raw: (n_row, n_chan, n_corr) — raw visibilities.
+    Returns: (n_row, n_chan, n_corr) — corrected visibilities.
+
+    Converts to 2x2, applies J^{-1} V J^{-H} per channel, converts back.
+    """
+    vis_22 = raw_to_2x2(vis_raw)            # (n_row, n_chan, 2, 2)
+    vis_22 = unapply_jones_to_rows(J_pre, vis_22, a1, a2)
+    n_row, n_chan = vis_22.shape[:2]
+    return vis_22.reshape(n_row, n_chan, 4)  # back to raw format
 
 
 def _unapply_on_averaged(J_pre, avg_vis, bl_a1, bl_a2):
@@ -501,10 +661,35 @@ def _unapply_on_averaged(J_pre, avg_vis, bl_a1, bl_a2):
 def _build_cells_from_raw(vis_raw, mod_raw, fl_raw, a1r, a2r,
                            freq_bins, freq_idx_bins, freq_dep, n_ant, ti,
                            preapply_at_tmid):
-    """Average raw data into tiny 2x2 cells for each freq_bin."""
+    """Average raw data into tiny 2x2 cells for each freq_bin.
+
+    When preapply is present, correction is applied at full spectral
+    resolution BEFORE averaging so that delay/bandpass phase gradients
+    are removed per-channel (matching CASA behaviour).
+    """
     tasks = []
+    J_pre = None
+    preapply_flagged = None
+    if preapply_at_tmid is not None and ti < len(preapply_at_tmid):
+        entry = preapply_at_tmid[ti]
+        if entry is not None:
+            J_pre, preapply_flagged = entry
+
+    # --- Apply preapply at full spectral resolution BEFORE averaging ---
+    if J_pre is not None:
+        vis_corr = _preapply_raw(J_pre, vis_raw, a1r, a2r)
+    else:
+        vis_corr = vis_raw
+
     for fi, (fb_f, f_idx) in enumerate(zip(freq_bins, freq_idx_bins)):
-        vf = vis_raw[:, f_idx, :]
+        # Check if prior solver flagged this freq bin
+        if preapply_flagged is not None and _is_preapply_flagged(preapply_flagged, fi):
+            tasks.append({"fi": fi, "ti": ti, "vis": None, "model": None,
+                           "a1": None, "a2": None, "freqs": fb_f,
+                           "prior_flagged": True})
+            continue
+
+        vf = vis_corr[:, f_idx, :]
         mf = mod_raw[:, f_idx, :]
         ff = fl_raw[:, f_idx, :]
 
@@ -522,14 +707,26 @@ def _build_cells_from_raw(vis_raw, mod_raw, fl_raw, a1r, a2r,
         avg_v_22 = raw_to_2x2(avg_v); del avg_v
         avg_m_22 = raw_to_2x2(avg_m); del avg_m
 
-        if preapply_at_tmid is not None and ti < len(preapply_at_tmid):
-            J_pre = preapply_at_tmid[ti]
-            if J_pre is not None:
-                avg_v_22 = _unapply_on_averaged(J_pre, avg_v_22, bl_a1, bl_a2)
-
         tasks.append({"fi": fi, "ti": ti, "vis": avg_v_22, "model": avg_m_22,
                        "a1": bl_a1, "a2": bl_a2, "freqs": fb_f})
+
+    if J_pre is not None:
+        del vis_corr
     return tasks
+
+
+def _is_preapply_flagged(bad_mask, fi):
+    """Check if freq bin fi is flagged in the preapply bad_mask.
+
+    bad_mask: (n_ant, n_freq) or (n_ant,) — True where prior solution is bad.
+    A freq bin is flagged if ANY antenna has a bad solution there.
+    """
+    if bad_mask.ndim == 1:
+        # Freq-independent: if any antenna is bad, all freq bins are bad
+        return bad_mask.any()
+    if fi >= bad_mask.shape[1]:
+        return False
+    return bad_mask[:, fi].any()
 
 
 def _compute_rows_per_tbin(row_times_all, time_bins):
@@ -644,7 +841,15 @@ def _compute_preapply_at_tmids(sb, step_idx, field_name, spw, freqs,
 
         if jones_list:
             J_total = compose_jones_chain(jones_list)
-            result.append(J_total)
+            # Detect NaN/inf — these freq bins are flagged by prior solvers.
+            # Replace with identity so unapply doesn't produce NaN data,
+            # but record which freq bins are bad so the cell gets skipped.
+            bad = ~np.isfinite(J_total)
+            bad_mask = bad.any(axis=(-2, -1))  # (n_ant, n_freq) or (n_ant,)
+            if bad_mask.any():
+                eye = np.eye(2, dtype=J_total.dtype)
+                J_total[bad_mask] = eye
+            result.append((J_total, bad_mask))
         else:
             result.append(None)
 
@@ -685,7 +890,8 @@ def _fmt_fields(fields_data, jones_type):
     for fn, sol in fields_data.items():
         out[fn] = {"times": sol["time"], "freqs": sol.get("freq"),
                     "jones": sol["jones"], "ra_rad": sol.get("ra_rad", 0),
-                    "dec_rad": sol.get("dec_rad", 0)}
+                    "dec_rad": sol.get("dec_rad", 0),
+                    "delay": sol.get("delay")}
     return out
 
 

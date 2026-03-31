@@ -340,6 +340,8 @@ class FluxscaleBlock:
     transfer_table: str
     transfer_field: List[str]
     output: str
+    ms: str
+    model_col: str = "MODEL_DATA"
     jones_type: str = "G"
     spw: Optional[List[SPWSelection]] = None
 
@@ -528,7 +530,8 @@ def _parse_fluxscale_block(d: Dict[str, Any]) -> FluxscaleBlock:
         return [str(x).strip()]
 
     jtype = d.get("jones_type", "G")
-    if jtype not in VALID_JONES:
+    import re as _re
+    if _re.sub(r'\d+$', '', jtype) not in VALID_JONES:
         raise ValueError(f"fluxscale jones_type {jtype!r} not valid")
 
     return FluxscaleBlock(
@@ -537,6 +540,8 @@ def _parse_fluxscale_block(d: Dict[str, Any]) -> FluxscaleBlock:
         transfer_table=d["transfer_table"],
         transfer_field=_to_list(d["transfer_field"]),
         output=d["output"],
+        ms=d["ms"],
+        model_col=d.get("model_col", "MODEL_DATA"),
         jones_type=jtype,
         spw=parse_spw_selection(d.get("spw")),
     )

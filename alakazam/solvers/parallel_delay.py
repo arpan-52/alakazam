@@ -76,18 +76,18 @@ class ParallelDelaySolver(JonesSolver):
         logger.debug(f"K solve: n_ant={n_ant} n_bl={vis_obs.shape[0]} "
                       f"n_freq={vis_obs.shape[1]} backend={self.backend}")
 
-        delay_init = self._initial_estimate(
+        delay_init, vis_obs_w, vis_mod_w = self._initial_estimate(
             vis_obs, vis_model, ant1, ant2, freqs, n_ant)
 
         if self.backend == "ceres":
             result = self._solve_ceres(
-                delay_init, vis_obs, ant1, ant2, freqs, n_ant)
+                delay_init, vis_obs_w, vis_mod_w, ant1, ant2, freqs, n_ant)
         elif self.backend == "scipy":
             result = self._solve_scipy_lm(
                 delay_init, vis_obs, vis_model, ant1, ant2, freqs, n_ant)
         elif self.backend == "jax":
             result = self._solve_jaxopt(
-                delay_init, vis_obs, ant1, ant2, freqs, n_ant)
+                delay_init, vis_obs, vis_model, ant1, ant2, freqs, n_ant)
         else:
             raise ValueError(f"Unknown backend: {self.backend!r}")
 
@@ -109,39 +109,21 @@ class ParallelDelaySolver(JonesSolver):
     # Ceres LM — analytic Jacobians, sparse Cholesky
     # ------------------------------------------------------------------
 
-    def _solve_ceres(self, delay_init, vis_obs, ant1, ant2, freqs, n_ant):
-        obs_pp = vis_obs[:, :, 0, 0]
-        obs_qq = vis_obs[:, :, 1, 1]
+    def _solve_ceres(self, delay_init, vis_obs, vis_model, ant1, ant2, freqs, n_ant):
+        from ._cpp_solvers import solve_delay
+        jones, delay_out, cost, n_iter, conv = solve_delay(
+            vis_obs.astype(np.complex128, copy=False),
+            vis_model.astype(np.complex128, copy=False),
+            freqs.astype(np.float64, copy=False),
+            ant1.astype(np.int32, copy=False),
+            ant2.astype(np.int32, copy=False),
+            n_ant, self.ref_ant, self.max_iter, self.tol,
+            delay_init.astype(np.float64, copy=False))
 
-        delays_p = [np.array([delay_init[a, 0]]) for a in range(n_ant)]
-        delays_q = [np.array([delay_init[a, 1]]) for a in range(n_ant)]
-
-        prob = pyceres.Problem()
-        for k in range(len(ant1)):
-            a1, a2 = int(ant1[k]), int(ant2[k])
-            prob.add_residual_block(
-                _DelayCost(obs_pp[k], freqs), None,
-                [delays_p[a1], delays_p[a2]])
-            prob.add_residual_block(
-                _DelayCost(obs_qq[k], freqs), None,
-                [delays_q[a1], delays_q[a2]])
-
-        prob.set_parameter_block_constant(delays_p[self.ref_ant])
-        prob.set_parameter_block_constant(delays_q[self.ref_ant])
-
-        opts = _ceres_opts(self.max_iter, self.tol)
-        summary = pyceres.SolverSummary()
-        pyceres.solve(opts, prob, summary)
-
-        result = np.zeros((n_ant, 2))
-        for a in range(n_ant):
-            result[a, 0] = delays_p[a][0]
-            result[a, 1] = delays_q[a][0]
+        result = np.asarray(delay_out)
         result[self.ref_ant, :] = 0.0
 
-        return (result.flatten(), float(summary.final_cost),
-                summary.num_successful_steps,
-                summary.termination_type == pyceres.TerminationType.CONVERGENCE)
+        return (result.flatten(), float(cost), int(n_iter), bool(conv))
 
     # ------------------------------------------------------------------
     # scipy LM — finite-difference Jacobians
@@ -166,7 +148,7 @@ class ParallelDelaySolver(JonesSolver):
     # jaxopt LM — autodiff, f32 on GPU
     # ------------------------------------------------------------------
 
-    def _solve_jaxopt(self, delay_init, vis_obs, ant1, ant2, freqs, n_ant):
+    def _solve_jaxopt(self, delay_init, vis_obs, vis_model, ant1, ant2, freqs, n_ant):
         import jax
         import jax.numpy as jnp
         from jaxopt import LevenbergMarquardt
@@ -184,6 +166,8 @@ class ParallelDelaySolver(JonesSolver):
         with jax.default_device(device):
             vobs_pp = jnp.array(vis_obs[:, :, 0, 0], dtype=cdtype)
             vobs_qq = jnp.array(vis_obs[:, :, 1, 1], dtype=cdtype)
+            vmod_pp = jnp.array(vis_model[:, :, 0, 0], dtype=cdtype)
+            vmod_qq = jnp.array(vis_model[:, :, 1, 1], dtype=cdtype)
             gf = jnp.array(freqs, dtype=fdtype)
             a1j = jnp.array(ant1)
             a2j = jnp.array(ant2)
@@ -192,8 +176,12 @@ class ParallelDelaySolver(JonesSolver):
                 d = x.reshape(n_ant, 2)
                 d = d.at[ref, :].set(0.0)
                 ph = (-2.0 * jnp.pi * 1e-9) * gf[None, :]
-                pp = jnp.exp(1j * d[a1j, 0:1] * ph) * jnp.exp(-1j * d[a2j, 0:1] * ph)
-                qq = jnp.exp(1j * d[a1j, 1:2] * ph) * jnp.exp(-1j * d[a2j, 1:2] * ph)
+                gi_pp = jnp.exp(1j * d[a1j, 0:1] * ph)
+                gj_pp = jnp.exp(-1j * d[a2j, 0:1] * ph)
+                gi_qq = jnp.exp(1j * d[a1j, 1:2] * ph)
+                gj_qq = jnp.exp(-1j * d[a2j, 1:2] * ph)
+                pp = gi_pp * vmod_pp * gj_pp
+                qq = gi_qq * vmod_qq * gj_qq
                 dp = vobs_pp - pp; dq = vobs_qq - qq
                 return jnp.concatenate([dp.real.ravel(), dp.imag.ravel(),
                                         dq.real.ravel(), dq.imag.ravel()])
@@ -223,9 +211,50 @@ class ParallelDelaySolver(JonesSolver):
     # ------------------------------------------------------------------
 
     def _initial_estimate(self, vis_obs, vis_model, ant1, ant2, freqs, n_ant):
+        # Per-baseline phase-linearity weights (vectorized).
+        # For each baseline: find best-fit delay via FFT, derotate cross-spectrum,
+        # measure residual phase RMS. Clean baselines (linear phase) have small RMS;
+        # non-linear baselines (bandpass ripple, etc.) have large RMS → low weight.
+        # weight[k] = 1 / (rms_res[k]^2 + noise_floor)
+        # Apply sqrt(weight) to both obs and model before Ceres.
+        n_bl, n_freq = vis_obs.shape[:2]
+        nfft = n_freq * 4
+        df = freqs[1] - freqs[0]
+        delay_axis = np.fft.fftfreq(nfft, d=df)                     # seconds, (nfft,)
+        vis_obs_w = vis_obs.copy()
+        vis_mod_w = vis_model.copy()
+        for pol in range(2):
+            xsp = vis_obs[:, :, pol, pol] * np.conj(vis_model[:, :, pol, pol])
+            bad = np.abs(vis_model[:, :, pol, pol]) < 1e-30
+            xsp[bad] = 0.0
+            n_good = (~bad).sum(axis=1).astype(np.float64)          # (n_bl,)
+
+            # Best-fit delay per baseline from FFT peak
+            spectra = np.fft.fft(xsp, n=nfft, axis=1)               # (n_bl, nfft)
+            peak_idx = np.argmax(np.abs(spectra), axis=1)            # (n_bl,)
+            tau_best = -delay_axis[peak_idx]                         # seconds, (n_bl,)
+
+            # Derotate: remove best-fit linear phase from cross-spectrum
+            derot_phase = (2.0 * np.pi * tau_best[:, np.newaxis]
+                           * freqs[np.newaxis, :])                   # (n_bl, n_freq)
+            xsp_d = xsp * np.exp(1j * derot_phase)                  # (n_bl, n_freq)
+
+            # Residual phase RMS per baseline (flagged channels contribute 0)
+            phi_res = np.angle(xsp_d)                                # (n_bl, n_freq)
+            phi_res[bad] = 0.0
+            rms_sq = np.sum(phi_res ** 2, axis=1) / np.maximum(n_good, 1.0)
+
+            # noise_floor ≈ (1/SNR)^2 per channel; use median as robust estimate
+            noise_floor = float(np.median(rms_sq)) * 0.1 + 1e-4
+            weight = 1.0 / (rms_sq + noise_floor)
+            w_sqrt = np.sqrt(weight / weight.max())                  # (n_bl,) in [0,1]
+
+            vis_obs_w[:, :, pol, pol] *= w_sqrt[:, np.newaxis]
+            vis_mod_w[:, :, pol, pol] *= w_sqrt[:, np.newaxis]
+
         adj = build_antenna_graph(ant1, ant2, n_ant)
         order = bfs_order(adj, self.ref_ant)
-        bl_delay = _bl_delay_fft(vis_obs, vis_model, ant1, ant2, freqs)
+        bl_delay = _bl_delay_fft(vis_obs_w, vis_mod_w, ant1, ant2, freqs)
         delay = np.zeros((n_ant, 2), dtype=np.float64)
         solved = np.zeros(n_ant, dtype=bool)
         solved[self.ref_ant] = True
@@ -238,7 +267,7 @@ class ParallelDelaySolver(JonesSolver):
                 if a2 == a and solved[a1]:
                     delay[a] = -bl_delay[k] + delay[a1]; solved[a] = True; break
         delay[self.ref_ant, :] = 0.0
-        return delay
+        return delay, vis_obs_w, vis_mod_w
 
 
 # ======================================================================
@@ -253,7 +282,7 @@ def _ceres_opts(max_iter, tol):
     opts.gradient_tolerance = tol
     opts.parameter_tolerance = tol
     opts.minimizer_progress_to_stdout = False
-    opts.num_threads = os.cpu_count()
+    opts.num_threads = 1  # parallelism is at cell level via ProcessPoolExecutor
     return opts
 
 

@@ -1,0 +1,75 @@
+# MeerKAT full polarization calibration
+# test.ms — sky models already loaded
+#
+# Fields:
+#   J1939-6342  flux + bandpass calibrator  (scan 28)
+#   J0408-6545  secondary bandpass + gain   (scan 1)
+#   J1239-1023  phase/amp calibrator        (scans 2,4,7,10,12,19,21)
+#   J1311-2216  phase/amp calibrator        (scans 5,7,9,13,15,17,22,24,26)
+#   J1331+3030  pol calibrator / 3C286      (scans 18,27)
+#
+# Solve order:
+#   K0  — delay on J1939
+#   G0  — bandpass on J1939 (2MHz bins)
+#   D0  — leakage on J1939
+#   G1  — time gains on all five fields (preapply K0+G0+D0)
+#   KC0 — cross delay on J1331 (internal preapply K0+G0+D0+G1)
+#   CP0 — cross phase on J1331 (internal preapply K0+G0+D0+G1+KC0)
+#
+# All steps in one solve block so internal preapply chain works correctly.
+# Fluxscale rescales G1 (J1939->others) after solve. Apply uses scaled G1.
+# KC/CP are phase quantities — unscaled G1 is fine for their preapply.
+
+# -----------------------------------------------------------------------
+# Solve: K, G(bandpass), D, G(time), KC, CP — one block
+# -----------------------------------------------------------------------
+
+solve:
+  - ms: test.ms
+    output: cal.h5
+    ref_ant: m002
+    apply_parang: true
+    solver_backend: ceres
+
+    jones: [K, G, D, G, KC, CP]
+
+    field:
+      - [J1939-6342]
+      - [J1939-6342]
+      - [J1939-6342]
+      - [J1939-6342, J0408-6545, J1239-1023, J1311-2216, J1331+3030]
+      - [J1331+3030]
+      - [J1331+3030]
+
+    time_interval: [scan, inf, inf, scan, inf, inf]
+    freq_interval: [full, 2MHz, full, full, full, full]
+    preapply_time_interp: [exact, nearest, nearest, nearest, nearest, nearest]
+
+# -----------------------------------------------------------------------
+# Fluxscale: bootstrap from J1939 to all transfer fields
+# -----------------------------------------------------------------------
+
+fluxscale:
+  - reference_table: cal.h5
+    reference_field: [J1939-6342]
+    transfer_table: cal.h5
+    transfer_field: [J0408-6545, J1239-1023, J1311-2216, J1331+3030]
+    output: cal_scaled.h5
+    ms: test.ms
+    model_col: MODEL_DATA
+    jones_type: G1
+
+# -----------------------------------------------------------------------
+# Apply full chain to all fields
+# -----------------------------------------------------------------------
+
+apply:
+  - ms: test.ms
+    output_col: CORRECTED_DATA
+    apply_parang: true
+    propagate_flags: true
+
+    jones:        [K0,      G0,      D0,      G1,            KC0,     CP0    ]
+    tables:       [cal.h5,  cal.h5,  cal.h5,  cal_scaled.h5, cal.h5,  cal.h5 ]
+    field_select: [nearest_time, nearest_time, nearest_time, nearest_time, nearest_time, nearest_time]
+    time_interp:  [nearest, nearest, nearest, linear,        nearest, nearest ]
