@@ -29,6 +29,8 @@ fluxscale:
     transfer_table: gains.h5
     transfer_field: [3C147]
     output: gains_scaled.h5
+    ms: allcals.ms
+    model_col: MODEL_DATA
     jones_type: G0
 
 apply:

@@ -156,34 +156,21 @@ class LeakageSolver(JonesSolver):
     # ------------------------------------------------------------------
 
     def _solve_ceres(self, dpq_init, dqp_init, obs, model, a1, a2, na):
-        params_dpq = [np.array([dpq_init[a].real, dpq_init[a].imag]) for a in range(na)]
-        params_dqp = [np.array([dqp_init[a].real, dqp_init[a].imag]) for a in range(na)]
+        from ._cpp_solvers import solve_leakage
+        jones, cost, n_iter, conv = solve_leakage(
+            obs.astype(np.complex128, copy=False),
+            model.astype(np.complex128, copy=False),
+            a1.astype(np.int32, copy=False),
+            a2.astype(np.int32, copy=False),
+            na, self.ref_ant, self.max_iter, self.tol,
+            dpq_init.astype(np.complex128, copy=False),
+            dqp_init.astype(np.complex128, copy=False))
 
-        prob = pyceres.Problem()
-        for k in range(len(a1)):
-            i, j = int(a1[k]), int(a2[k])
-            prob.add_residual_block(
-                _LeakageCost(obs[k], model[k]),
-                None, [params_dpq[i], params_dqp[i], params_dpq[j], params_dqp[j]])
-
-        # Only fix d_pq at ref — d_qp stays free
-        prob.set_parameter_block_constant(params_dpq[self.ref_ant])
-
-        from .parallel_delay import _ceres_opts
-        opts = _ceres_opts(self.max_iter, self.tol)
-        summary = pyceres.SolverSummary()
-        pyceres.solve(opts, prob, summary)
-
-        dpq_out = np.zeros(na, dtype=np.complex128)
-        dqp_out = np.zeros(na, dtype=np.complex128)
-        for a in range(na):
-            dpq_out[a] = params_dpq[a][0] + 1j * params_dpq[a][1]
-            dqp_out[a] = params_dqp[a][0] + 1j * params_dqp[a][1]
+        dpq_out = jones[:, 0, 1]
+        dqp_out = jones[:, 1, 0]
         dpq_out[self.ref_ant] = 0.0
 
-        return (self._pack(dpq_out, dqp_out), float(summary.final_cost),
-                summary.num_successful_steps,
-                summary.termination_type == pyceres.TerminationType.CONVERGENCE)
+        return (self._pack(dpq_out, dqp_out), float(cost), int(n_iter), bool(conv))
 
     # ------------------------------------------------------------------
     # scipy LM

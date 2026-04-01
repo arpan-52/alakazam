@@ -132,40 +132,23 @@ class GainsSolver(JonesSolver):
     # ------------------------------------------------------------------
 
     def _solve_ceres(self, amp_init, phase_init, obs, model, a1, a2, na):
-        amp_p = [np.array([amp_init[a, 0]]) for a in range(na)]
-        phi_p = [np.array([phase_init[a, 0]]) for a in range(na)]
-        amp_q = [np.array([amp_init[a, 1]]) for a in range(na)]
-        phi_q = [np.array([phase_init[a, 1]]) for a in range(na)]
+        from ._cpp_solvers import solve_gains
+        jones, cost, n_iter, conv = solve_gains(
+            obs.astype(np.complex128, copy=False),
+            model.astype(np.complex128, copy=False),
+            a1.astype(np.int32, copy=False),
+            a2.astype(np.int32, copy=False),
+            na, self.ref_ant, self.max_iter, self.tol,
+            amp_init, phase_init, self.phase_only)
 
-        prob = pyceres.Problem()
-        for k in range(len(a1)):
-            i, j = int(a1[k]), int(a2[k])
-            prob.add_residual_block(
-                _GainCost(obs[k, 0, 0], model[k, 0, 0]),
-                None, [amp_p[i], phi_p[i], amp_p[j], phi_p[j]])
-            prob.add_residual_block(
-                _GainCost(obs[k, 1, 1], model[k, 1, 1]),
-                None, [amp_q[i], phi_q[i], amp_q[j], phi_q[j]])
-
-        # Only fix PHASE at ref — amp stays free
-        prob.set_parameter_block_constant(phi_p[self.ref_ant])
-        prob.set_parameter_block_constant(phi_q[self.ref_ant])
-
-        from .parallel_delay import _ceres_opts
-        opts = _ceres_opts(self.max_iter, self.tol)
-        summary = pyceres.SolverSummary()
-        pyceres.solve(opts, prob, summary)
-
-        amp_out = np.zeros((na, 2))
-        phase_out = np.zeros((na, 2))
-        for a in range(na):
-            amp_out[a, 0] = amp_p[a][0]; phase_out[a, 0] = phi_p[a][0]
-            amp_out[a, 1] = amp_q[a][0]; phase_out[a, 1] = phi_q[a][0]
+        gp = jones[:, 0, 0]; gq = jones[:, 1, 1]
+        amp_out = np.column_stack([np.abs(gp), np.abs(gq)])
+        phase_out = np.column_stack([np.angle(gp), np.angle(gq)])
         phase_out[self.ref_ant, :] = 0.0
+        if self.phase_only:
+            amp_out = np.ones_like(amp_out)
 
-        return (self._pack(amp_out, phase_out), float(summary.final_cost),
-                summary.num_successful_steps,
-                summary.termination_type == pyceres.TerminationType.CONVERGENCE)
+        return (self._pack(amp_out, phase_out), float(cost), int(n_iter), bool(conv))
 
     # ------------------------------------------------------------------
     # scipy LM

@@ -299,8 +299,12 @@ def copy_solutions(src, dst):
             if k not in d:
                 s.copy(k, d)
 
-def rescale_solutions(path, jones_type, field_name, spw, scale_p, scale_q):
-    """Rescale jones solutions across all scans for a field/spw."""
+def rescale_solutions(path, jones_type, field_name, spw, factor_p, factor_q):
+    """Rescale jones solutions across all scans for a field/spw.
+
+    factor_p / factor_q are direct amplitude multipliers applied to
+    the Jones diagonal (no sqrt taken internally).
+    """
     with h5py.File(path, "a") as f:
         fk = f"{jones_type}/{_fk(field_name)}"
         if fk not in f:
@@ -313,16 +317,16 @@ def rescale_solutions(path, jones_type, field_name, spw, scale_p, scale_q):
                 if sk in fg[key] and "jones" in fg[key][sk]:
                     jpath = f"{fk}/{key}/{sk}/jones"
                     j = f[jpath][:]
-                    j[..., 0, 0] *= np.sqrt(scale_p)
-                    j[..., 1, 1] *= np.sqrt(scale_q)
+                    j[..., 0, 0] *= factor_p
+                    j[..., 1, 1] *= factor_q
                     f[jpath][...] = j
                     rescaled = True
             elif key == _sk(spw) and "jones" in fg[key]:
                 # Legacy layout
                 jpath = f"{fk}/{key}/jones"
                 j = f[jpath][:]
-                j[..., 0, 0] *= np.sqrt(scale_p)
-                j[..., 1, 1] *= np.sqrt(scale_q)
+                j[..., 0, 0] *= factor_p
+                j[..., 1, 1] *= factor_q
                 f[jpath][...] = j
                 rescaled = True
         if not rescaled:

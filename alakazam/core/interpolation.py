@@ -60,48 +60,75 @@ def _interp_nearest(sol_times, sol_data, target_times):
 
 
 def _interp_linear(sol_times, sol_data, target_times):
-    """Linear in time using amp/phase for complex data."""
+    """Linear in time using amp/phase for complex data.
+    Excludes NaN (flagged) time slots from interpolation."""
     if len(sol_times) < 2:
         return _interp_nearest(sol_times, sol_data, target_times)
 
     n_t = len(target_times)
     shape = sol_data.shape[1:]
     flat = sol_data.reshape(len(sol_times), -1)
-    out = np.empty((n_t, flat.shape[1]), dtype=np.complex128)
+    out = np.full((n_t, flat.shape[1]), np.nan + 0j, dtype=np.complex128)
     tc = np.clip(target_times, sol_times[0], sol_times[-1])
 
-    amp = np.abs(flat); phase = np.unwrap(np.angle(flat), axis=0)
     for k in range(flat.shape[1]):
-        a = np.interp(tc, sol_times, amp[:, k])
-        p = np.interp(tc, sol_times, phase[:, k])
+        good = np.isfinite(flat[:, k])
+        if good.sum() < 2:
+            if good.sum() == 1:
+                # Single unflagged point: nearest
+                out[:, k] = flat[good, k][0]
+            # else: all flagged, leave NaN
+            continue
+        gt = sol_times[good]
+        amp = np.abs(flat[good, k])
+        phase = np.unwrap(np.angle(flat[good, k]))
+        tc_k = np.clip(tc, gt[0], gt[-1])
+        a = np.interp(tc_k, gt, amp)
+        p = np.interp(tc_k, gt, phase)
         out[:, k] = a * np.exp(1j * p)
     return out.reshape((n_t,) + shape)
 
 
 def _interp_cubic(sol_times, sol_data, target_times):
+    """Cubic spline in time using amp/phase.
+    Excludes NaN (flagged) time slots. Falls back to linear if < 4 good points."""
     if not HAS_SCIPY or len(sol_times) < 4:
         return _interp_linear(sol_times, sol_data, target_times)
 
     n_t = len(target_times)
     shape = sol_data.shape[1:]
     flat = sol_data.reshape(len(sol_times), -1)
-    out = np.empty((n_t, flat.shape[1]), dtype=np.complex128)
+    out = np.full((n_t, flat.shape[1]), np.nan + 0j, dtype=np.complex128)
     tc = np.clip(target_times, sol_times[0], sol_times[-1])
 
-    amp = np.abs(flat); phase = np.unwrap(np.angle(flat), axis=0)
     for k in range(flat.shape[1]):
+        good = np.isfinite(flat[:, k])
+        n_good = good.sum()
+        if n_good < 2:
+            if n_good == 1:
+                out[:, k] = flat[good, k][0]
+            continue
+        gt = sol_times[good]
+        amp = np.abs(flat[good, k])
+        phase = np.unwrap(np.angle(flat[good, k]))
+        tc_k = np.clip(tc, gt[0], gt[-1])
+        if n_good < 4:
+            # Not enough for cubic, use linear
+            out[:, k] = np.interp(tc_k, gt, amp) * np.exp(
+                1j * np.interp(tc_k, gt, phase))
+            continue
         try:
-            ca = CubicSpline(sol_times, amp[:, k], extrapolate=False)
-            cp = CubicSpline(sol_times, phase[:, k], extrapolate=False)
-            a = ca(tc); p = cp(tc)
+            ca = CubicSpline(gt, amp, extrapolate=False)
+            cp_s = CubicSpline(gt, phase, extrapolate=False)
+            a = ca(tc_k); p = cp_s(tc_k)
             bad = np.isnan(a) | np.isnan(p)
             if bad.any():
-                a = np.where(bad, np.interp(tc, sol_times, amp[:, k]), a)
-                p = np.where(bad, np.interp(tc, sol_times, phase[:, k]), p)
+                a = np.where(bad, np.interp(tc_k, gt, amp), a)
+                p = np.where(bad, np.interp(tc_k, gt, phase), p)
             out[:, k] = a * np.exp(1j * p)
         except Exception:
-            out[:, k] = np.interp(tc, sol_times, amp[:, k]) * np.exp(
-                1j * np.interp(tc, sol_times, phase[:, k]))
+            out[:, k] = np.interp(tc_k, gt, amp) * np.exp(
+                1j * np.interp(tc_k, gt, phase))
     return out.reshape((n_t,) + shape)
 
 
@@ -142,9 +169,15 @@ def interpolate_delay(sol_times, sol_delay, target_times, target_freqs, time_int
         tc = np.clip(target_times, sol_times[0], sol_times[-1])
         shape = d.shape[1:]
         flat = d.reshape(n_sol_t, -1)
-        out = np.empty((n_tt, flat.shape[1]), dtype=np.float64)
+        out = np.full((n_tt, flat.shape[1]), np.nan, dtype=np.float64)
         for k in range(flat.shape[1]):
-            out[:, k] = np.interp(tc, sol_times, flat[:, k])
+            good = np.isfinite(flat[:, k])
+            if good.sum() < 2:
+                if good.sum() == 1:
+                    out[:, k] = flat[good, k][0]
+                continue
+            gt = sol_times[good]
+            out[:, k] = np.interp(np.clip(tc, gt[0], gt[-1]), gt, flat[good, k])
         d_interp = out.reshape((n_tt,) + shape)
     else:
         idx = np.argmin(np.abs(sol_times[:, None] - target_times[None, :]), axis=0)

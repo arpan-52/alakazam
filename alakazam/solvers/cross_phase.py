@@ -105,23 +105,17 @@ class CrossPhaseSolver(JonesSolver):
     # ------------------------------------------------------------------
 
     def _solve_ceres(self, x0, obs, model, a1, a2, na):
-        param = np.array([x0[0]])
-        prob = pyceres.Problem()
-        prob.add_residual_block(
-            _CrossPhaseCost(obs[:, 0, 1], model[:, 0, 1], is_pq=True),
-            None, [param])
-        prob.add_residual_block(
-            _CrossPhaseCost(obs[:, 1, 0], model[:, 1, 0], is_pq=False),
-            None, [param])
+        from ._cpp_solvers import solve_cross_phase
+        jones, cost, n_iter, conv = solve_cross_phase(
+            obs.astype(np.complex128, copy=False),
+            model.astype(np.complex128, copy=False),
+            a1.astype(np.int32, copy=False),
+            a2.astype(np.int32, copy=False),
+            na, self.max_iter, self.tol,
+            float(x0[0]))
 
-        from .parallel_delay import _ceres_opts
-        opts = _ceres_opts(self.max_iter, self.tol)
-        summary = pyceres.SolverSummary()
-        pyceres.solve(opts, prob, summary)
-
-        return (param, float(summary.final_cost),
-                summary.num_successful_steps,
-                summary.termination_type == pyceres.TerminationType.CONVERGENCE)
+        param = np.array([np.angle(jones[0, 1, 1])])
+        return (param, float(cost), int(n_iter), bool(conv))
 
     # ------------------------------------------------------------------
     # scipy LM

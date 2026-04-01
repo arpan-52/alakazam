@@ -112,25 +112,21 @@ class CrossDelaySolver(JonesSolver):
     # ------------------------------------------------------------------
 
     def _solve_ceres(self, x0, vis_obs, vis_model, freqs):
-        param = np.array([x0[0]])
-        prob = pyceres.Problem()
-        prob.add_residual_block(
-            _CrossDelayCost(vis_obs[:, :, 0, 1], vis_model[:, :, 0, 1],
-                            freqs, is_pq=True),
-            None, [param])
-        prob.add_residual_block(
-            _CrossDelayCost(vis_obs[:, :, 1, 0], vis_model[:, :, 1, 0],
-                            freqs, is_pq=False),
-            None, [param])
+        from ._cpp_solvers import solve_cross_delay
+        n_ant = vis_obs.shape[0]  # not used in solve, but needed for Jones output
+        # n_ant isn't available here — get from caller context
+        # Actually solve() passes it, but _solve_ceres doesn't receive it
+        # We need it for the C++ function; pass a reasonable default
+        jones, delay_out, cost, n_iter, conv = solve_cross_delay(
+            vis_obs.astype(np.complex128, copy=False),
+            vis_model.astype(np.complex128, copy=False),
+            freqs.astype(np.float64, copy=False),
+            1,  # n_ant placeholder — only tau matters
+            self.max_iter, self.tol,
+            float(x0[0]))
 
-        from .parallel_delay import _ceres_opts
-        opts = _ceres_opts(self.max_iter, self.tol)
-        summary = pyceres.SolverSummary()
-        pyceres.solve(opts, prob, summary)
-
-        return (param, float(summary.final_cost),
-                summary.num_successful_steps,
-                summary.termination_type == pyceres.TerminationType.CONVERGENCE)
+        param = np.array([delay_out[0, 0]])
+        return (param, float(cost), int(n_iter), bool(conv))
 
     # ------------------------------------------------------------------
     # scipy LM

@@ -188,20 +188,28 @@ def _build_taql(ms_path, spw, fields=None, scans=None, time_range=None):
 
 def read_data(ms_path, spw, fields=None, scans=None,
               data_col="DATA", model_col="MODEL_DATA",
-              chan_slice=slice(None), time_range=None):
+              chan_slice=slice(None), time_range=None,
+              need_rowids=True):
     """Read raw visibilities. Returns (n_row, n_chan, n_corr) arrays.
-    No 2x2 conversion — that happens later on averaged data."""
+    No 2x2 conversion — that happens later on averaged data.
+
+    need_rowids: if False, skip ROWID() in TaQL (much faster).
+    Only the apply path needs row_ids; solve path does not.
+    """
     from casacore.tables import table, taql
 
     with suppress_stderr():
         ms = table(ms_path, readonly=True, ack=False)
         query = _build_taql(ms_path, spw, fields, scans, time_range)
-        sub = taql(f"SELECT ROWID() AS RID, * FROM $ms WHERE {query}")
+        if need_rowids:
+            sub = taql(f"SELECT ROWID() AS RID, * FROM $ms WHERE {query}")
+        else:
+            sub = taql(f"SELECT * FROM $ms WHERE {query}")
 
     if sub.nrows() == 0:
         sub.close(); ms.close(); return {}
 
-    row_ids = sub.getcol("RID")
+    row_ids = sub.getcol("RID") if need_rowids else None
     vis_obs = sub.getcol(data_col)                    # (n_row, n_chan, n_corr)
 
     if model_col not in sub.colnames():
@@ -295,10 +303,11 @@ def _find_contiguous_chunks(row_ids):
 
 def write_corrected(ms_path, row_ids, corrected, output_col="CORRECTED_DATA"):
     """Write corrected (n_row, n_chan, 2, 2) back to MS."""
-    from casacore.tables import table, makearrcoldesc, maketabdesc
+    from casacore.tables import table
 
     nr, nc = corrected.shape[:2]
-    flat = np.zeros((nr, nc, 4), dtype=np.complex128)
+    # Use complex64 — CASA stores visibilities as Complex (32-bit), not DComplex
+    flat = np.zeros((nr, nc, 4), dtype=np.complex64)
     flat[..., 0] = corrected[..., 0, 0]
     flat[..., 1] = corrected[..., 0, 1]
     flat[..., 2] = corrected[..., 1, 0]
@@ -306,9 +315,10 @@ def write_corrected(ms_path, row_ids, corrected, output_col="CORRECTED_DATA"):
 
     ms = table(ms_path, readonly=False, ack=False)
     if output_col not in ms.colnames():
+        # Clone DATA descriptor exactly (same type/shape/tiling), just rename
         desc = ms.getcoldesc("DATA")
-        ms.addcols(maketabdesc(makearrcoldesc(
-            output_col, 0+0j, ndim=desc.get("ndim", 2), shape=desc.get("shape"))))
+        desc["name"] = output_col
+        ms.addcols({output_col: desc})
 
     chunks = _find_contiguous_chunks(np.asarray(row_ids))
     for startrow, idx in chunks:
