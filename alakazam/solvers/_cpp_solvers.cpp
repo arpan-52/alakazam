@@ -156,12 +156,12 @@ py::tuple solve_gains(
     ceres::Solve(opts, &problem, &summary);
 
     // Pack result: (n_ant, 2, 2) Jones
+    phi_p[ref_ant] = 0.0; phi_q[ref_ant] = 0.0;
     auto jones = py::array_t<cd>({n_ant, 2, 2});
     auto j = jones.mutable_unchecked<3>();
     for (int a = 0; a < n_ant; a++) {
         double ap = phase_only ? 1.0 : amp_p[a];
         double aq = phase_only ? 1.0 : amp_q[a];
-        phi_p[ref_ant] = 0.0; phi_q[ref_ant] = 0.0;
         j(a, 0, 0) = cd(ap * cos(phi_p[a]), ap * sin(phi_p[a]));
         j(a, 0, 1) = cd(0.0, 0.0);
         j(a, 1, 0) = cd(0.0, 0.0);
@@ -580,44 +580,14 @@ struct CrossDelayCost : public ceres::CostFunction {
                 res[2*idx+1] = obs_im[idx] - pi_;
 
                 if (jac && jac[0]) {
-                    double dph = -twopi_nu[f];
-                    double djr, dji;
-                    if (is_pq) { djr = sp * dph; dji = -cp * dph; }
-                    else { djr = sp * dph; dji = cp * dph; }
-                    // Wait: d(cos(phase))/dtau = -sin(phase) * dphase/dtau
-                    // dphase/dtau = -twopi_nu[f]
-                    if (is_pq) {
-                        djr = -(-sp) * twopi_nu[f];  // sp * twopi_nu
-                        dji = -(cp) * (-twopi_nu[f]); // cp * twopi_nu
-                    } else {
-                        djr = -(-sp) * twopi_nu[f];
-                        dji = -(-(- cp)) * (-twopi_nu[f]);
-                    }
-                    // Simpler: let me redo this cleanly
                     // phase = -twopi_nu * tau
-                    // if is_pq: J = exp(i*phase) = cos(ph) + i*sin(ph)
-                    //   dJ/dtau = i * (-twopi_nu) * J
-                    //   dJ_re/dtau = -(-twopi_nu)*sin(ph) = twopi_nu*sin(ph)
-                    //   dJ_im/dtau = (-twopi_nu)*cos(ph)
-                    // if !is_pq: J = exp(-i*phase) = cos(ph) - i*sin(ph)
-                    //   dJ/dtau = -i * (-twopi_nu) * J = i*twopi_nu*J
-                    //   dJ_re/dtau = -twopi_nu*(-sin(ph)) = twopi_nu*sin(ph)  same?
-                    //   Actually exp(-i*phase) = cos(-phase) + i*sin(-phase) = cos(phase) - i*sin(phase)
-                    //   d/dtau = (-i)(-twopi_nu) exp(-i*phase) = i*twopi_nu * (cos(ph) - i*sin(ph))
-                    //   = twopi_nu * (-sin(ph) + i*cos(ph))... hmm
-                    // Let me just do it numerically-clean:
+                    // is_pq:  J = exp(i*phase),  dJ/dtau = i*(-twopi_nu)*J
+                    // !is_pq: J = exp(-i*phase), dJ/dtau = -i*(-twopi_nu)*J = i*twopi_nu*J
                     double dph_dtau = -twopi_nu[f];
                     double d_cp = -sp * dph_dtau;   // d(cos(phase))/dtau
-                    double d_sp = cp * dph_dtau;     // d(sin(phase))/dtau
-
-                    double djr_dt, dji_dt;
-                    if (is_pq) {
-                        djr_dt = d_cp;   // d(jr)/dtau where jr = cos(phase)
-                        dji_dt = d_sp;   // d(ji)/dtau where ji = sin(phase)
-                    } else {
-                        djr_dt = d_cp;
-                        dji_dt = -d_sp;  // ji = -sin(phase)
-                    }
+                    double d_sp =  cp * dph_dtau;   // d(sin(phase))/dtau
+                    double djr_dt = d_cp;
+                    double dji_dt = is_pq ? d_sp : -d_sp;
                     double dpr = djr_dt * mod_re[idx] - dji_dt * mod_im[idx];
                     double dpi = djr_dt * mod_im[idx] + dji_dt * mod_re[idx];
                     jac[0][2*idx]   = -dpr;
