@@ -13,14 +13,6 @@ Memory-aware batching: loads groups of time_bins that fit in RAM.
 Each batch: load -> flag -> average -> free raw -> solve -> store.
 
 Developed by Arpan Pal 2026, NRAO / NCRA
-
-I have learnt some of the quite interesting aspects while developing this sucker. In a quite reasonable shape now.
-
-CERES is the show-stopper, do I want a solver with no external control or use the state of the art from Google? For now, let's stick with Ceres, seems fast, accurate and built for sparse non-linear least sqaure problems.
-
-The future is definitely not scipy, is it Ceres? or if I write a sparse alegbric solver, I will try the GPU one.
-
-Cheers. \/ \/ n
 """
 
 from __future__ import annotations
@@ -423,7 +415,7 @@ def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
             tasks = []
             for fi in range(n_freq):
                 # Skip cells where prior solver has no solution
-                if preapply_flagged_t3 is not None and _is_preapply_flagged(preapply_flagged_t3, fi):
+                if preapply_flagged_t3 is not None and _is_preapply_flagged(preapply_flagged_t3, fi, len(freq_idx_bins[fi])):
                     tasks.append({"fi": fi, "ti": ti, "vis": None, "model": None,
                                    "a1": None, "a2": None, "freqs": freq_bins[fi],
                                    "prior_flagged": True})
@@ -626,6 +618,10 @@ def _preapply_raw(J_pre, vis_raw, a1, a2):
     Converts to 2x2, applies J^{-1} V J^{-H} per channel, converts back.
     """
     vis_22 = raw_to_2x2(vis_raw)            # (n_row, n_chan, 2, 2)
+    n_chan_vis = vis_22.shape[1]
+    if J_pre.ndim == 4 and J_pre.shape[1] == 1 and n_chan_vis > 1:
+        J_pre = np.broadcast_to(
+            J_pre, (J_pre.shape[0], n_chan_vis, 2, 2)).copy()
     vis_22 = unapply_jones_to_rows(J_pre, vis_22, a1, a2)
     n_row, n_chan = vis_22.shape[:2]
     return vis_22.reshape(n_row, n_chan, 4)  # back to raw format
@@ -683,7 +679,7 @@ def _build_cells_from_raw(vis_raw, mod_raw, fl_raw, a1r, a2r,
 
     for fi, (fb_f, f_idx) in enumerate(zip(freq_bins, freq_idx_bins)):
         # Check if prior solver flagged this freq bin
-        if preapply_flagged is not None and _is_preapply_flagged(preapply_flagged, fi):
+        if preapply_flagged is not None and _is_preapply_flagged(preapply_flagged, fi, len(f_idx)):
             tasks.append({"fi": fi, "ti": ti, "vis": None, "model": None,
                            "a1": None, "a2": None, "freqs": fb_f,
                            "prior_flagged": True})
@@ -715,17 +711,24 @@ def _build_cells_from_raw(vis_raw, mod_raw, fl_raw, a1r, a2r,
     return tasks
 
 
-def _is_preapply_flagged(bad_mask, fi):
+def _is_preapply_flagged(bad_mask, fi, n_raw_chans=1):
     """Check if freq bin fi is flagged in the preapply bad_mask.
 
     bad_mask: (n_ant, n_freq) or (n_ant,) — True where prior solution is bad.
-    A freq bin is flagged if ANY antenna has a bad solution there.
+    n_raw_chans: raw channels covered by this solve cell.
+
+    For a full-band solve cell (n_raw_chans > prior n_freq bins), the prior
+    has been resampled to match — only skip if >80% of all prior bins are bad.
+    For a per-channel solve cell, skip if any antenna is bad at that exact bin.
     """
     if bad_mask.ndim == 1:
-        # Freq-independent: if any antenna is bad, all freq bins are bad
         return bad_mask.any()
     if fi >= bad_mask.shape[1]:
         return False
+    # Full-band cell: solve covers more raw channels than prior has bins.
+    # Partial prior coverage is OK — only skip if almost entirely bad.
+    if n_raw_chans >= bad_mask.shape[1]:
+        return bad_mask.any(axis=0).mean() > 0.8
     return bad_mask[:, fi].any()
 
 

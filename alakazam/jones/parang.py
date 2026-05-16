@@ -62,6 +62,7 @@ def compute_parallactic_angles(
         quantity(phase_dir[0, 0], "rad"),
         quantity(phase_dir[0, 1], "rad"),
     )
+    zenith_azel = dm.direction("AZEL", "0deg", "90deg")
 
     n_time = len(unique_times)
     parang = np.zeros((n_time, n_ant), dtype=np.float64)
@@ -79,7 +80,7 @@ def compute_parallactic_angles(
                 )
                 dm.do_frame(pos)
                 parang[t, a] = dm.posangle(
-                    src_dir, dm.direction("ZENITH")).get_value("rad")
+                    src_dir, zenith_azel).get_value("rad")
 
     return parang
 

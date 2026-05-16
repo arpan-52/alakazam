@@ -21,9 +21,6 @@ def main():
     warnings.filterwarnings("ignore", message=".*ZENITH.*")
     warnings.filterwarnings("ignore", message=".*MeasureHolder.*")
 
-    # Suppress JAX TPU probe message
-    os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
-
     parser = argparse.ArgumentParser(
         prog="alakazam",
         description="ALAKAZAM v1 — Radio Interferometric Calibration Pipeline",

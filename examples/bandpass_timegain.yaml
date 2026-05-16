@@ -17,7 +17,7 @@ solve:
     data_col: DATA
     model_col: MODEL_DATA
     apply_parang: true
-    solver_backend: ceres
+    solver_backend: boa
     rfi_threshold: 5.0
 
     jones: [K, G, G]
