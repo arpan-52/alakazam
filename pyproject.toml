@@ -6,6 +6,11 @@ build-backend = "setuptools.build_meta"
 name = "alakazam"
 version = "1.0.0"
 description = "Radio interferometric calibration pipeline"
+readme = "README.md"
+license = "MIT"
+authors = [
+    {name = "Arpan Pal", email = "arpan7303@gmail.com"}
+]
 requires-python = ">=3.9"
 dependencies = [
     "numpy>=1.24",
@@ -15,14 +20,8 @@ dependencies = [
     "numba>=0.57",
     "psutil>=5.9",
     "rich>=13.0",
-    "jax>=0.4",
-    "jaxlib>=0.4",
     "python-casacore>=3.5",
-    "pyceres>=2.1",
 ]
-
-[project.optional-dependencies]
-all = ["jax>=0.4", "jaxlib>=0.4", "python-casacore>=3.5"]
 
 [project.scripts]
 alakazam = "alakazam.cli:main"

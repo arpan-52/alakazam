@@ -5,8 +5,6 @@
   T2: N slots fit           -> batched load
   T3: One slot too big      -> single slot at a time
 
-Also detects GPU VRAM for JAX/PyTorch GPU backends.
-
 Developed by Arpan Pal 2026, NRAO / NCRA
 """
 
@@ -27,7 +25,7 @@ def get_available_ram_gb() -> float:
 
 
 def get_available_vram_gb() -> float:
-    """Return available GPU VRAM in GB.  0 if no GPU."""
+    """Return available GPU VRAM in GB. 0 if no GPU or detection fails."""
     try:
         import subprocess
         result = subprocess.run(
@@ -35,24 +33,10 @@ def get_available_vram_gb() -> float:
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=5)
         if result.returncode == 0:
-            # Take first GPU
             free_mb = float(result.stdout.strip().split("\n")[0])
             return free_mb / 1024.0
     except Exception:
         pass
-
-    # Try JAX
-    try:
-        import jax
-        devs = [d for d in jax.devices() if d.platform == "gpu"]
-        if devs:
-            # JAX doesn't easily expose free VRAM; estimate 80% of total
-            stats = devs[0].memory_stats()
-            if stats:
-                return stats.get("bytes_limit", 0) * 0.8 / (1024**3)
-    except Exception:
-        pass
-
     return 0.0
 
 

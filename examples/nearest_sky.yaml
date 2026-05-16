@@ -10,7 +10,7 @@ solve:
   - ms: survey.ms
     output: cal.h5
     ref_ant: 0
-    solver_backend: ceres
+    solver_backend: boa
 
     jones: [K, G]
     field:

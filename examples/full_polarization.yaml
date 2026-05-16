@@ -18,7 +18,7 @@ solve:
     output: polcal.h5
     ref_ant: 9
     apply_parang: true
-    solver_backend: ceres
+    solver_backend: boa
 
     jones: [K, G, G, D, KC, CP]
 

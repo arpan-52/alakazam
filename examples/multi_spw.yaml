@@ -9,7 +9,7 @@ solve:
   - ms: multiband.ms
     output: cal.h5
     ref_ant: C04
-    solver_backend: ceres
+    solver_backend: boa
     spw: "0,1,2,3"                 # calibrate SPWs 0-3
 
     jones: [K, G]

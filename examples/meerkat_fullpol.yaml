@@ -29,7 +29,7 @@ solve:
     output: cal.h5
     ref_ant: m002
     apply_parang: true
-    solver_backend: ceres
+    solver_backend: boa
 
     jones: [K, G, D, G, KC, CP]
 

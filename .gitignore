@@ -64,3 +64,13 @@ Thumbs.db
 *.log
 tmp/
 temp/
+
+# pixi
+.pixi/
+
+# boa build artifacts
+alakazam/boa/build/
+
+# Calibration outputs (data products)
+*.h5
+*.ms/

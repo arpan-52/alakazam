@@ -1,13 +1,13 @@
 """ALAKAZAM v1 Solvers.
 
-ABC, BFS helpers, backend detection, optimizer wrappers, registry.
+ABC, BFS helpers, registry.
 
 Every solver:
   - receives averaged data for ONE cell (n_bl, 2, 2) or (n_bl, n_chan, 2, 2)
   - returns (n_ant, 2, 2) jones + stats
   - computes its own initial guess from the data it receives
 
-Backends: jax (default), scipy. Falls back to scipy LM.
+Backend: boa (Kokkos LM — CPU/OpenMP or GPU/CUDA depending on build)
 
 Developed by Arpan Pal 2026, NRAO / NCRA
 """
@@ -28,51 +28,36 @@ logger = logging.getLogger("alakazam")
 # Backend detection
 # -------------------------------------------------------------------
 
-_jax_device = None   # resolved once by detect_device, reused everywhere
+_boa_device: Optional[str] = None
 
 def detect_device(backend: str, force_gpu: bool = False) -> str:
-    """Probe JAX GPU once. If GPU works, use it; otherwise fall back to CPU.
-    Suppresses CuDNN/CUDA stderr noise during the probe."""
-    global _jax_device
-    if backend in ("ceres", "scipy"):
-        return "cpu"
-    if _jax_device is not None:
-        return "gpu" if _jax_device.platform == "gpu" else "cpu"
-    if backend != "jax":
-        return "cpu"
-    import os, sys
+    """Detect boa execution space (Kokkos backend).
+
+    Returns 'cuda', 'hip', 'openmp', or 'serial' depending on how
+    Kokkos was compiled. Queries boa once and caches the result.
+    """
+    global _boa_device
+    if _boa_device is not None:
+        return _boa_device
+
+    if backend != "boa":
+        _boa_device = "cpu"
+        return _boa_device
+
     try:
-        # Suppress CuDNN stderr during probe
-        stderr_fd = sys.stderr.fileno()
-        devnull = os.open(os.devnull, os.O_WRONLY)
-        saved_stderr = os.dup(stderr_fd)
-        os.dup2(devnull, stderr_fd)
-        os.close(devnull)
-        try:
-            import jax
-            import jax.numpy as jnp
-            gpus = [d for d in jax.devices() if d.platform == "gpu"]
-            if gpus or force_gpu:
-                # Actually run something on GPU to catch CuDNN mismatches
-                with jax.default_device(gpus[0]):
-                    _ = jnp.ones(2, dtype=jnp.float64).sum().block_until_ready()
-                _jax_device = gpus[0]
-        except Exception:
-            pass
-        finally:
-            os.dup2(saved_stderr, stderr_fd)
-            os.close(saved_stderr)
-    except Exception:
-        pass
+        from .boa_backend import import_boa
+        boa = import_boa()
+        # If boa exposes execution_space(), use it
+        if hasattr(boa, 'execution_space'):
+            _boa_device = boa.execution_space()
+        else:
+            # Default: assume Kokkos default execution space
+            # GPU builds typically use CUDA/HIP; CPU builds use OpenMP/Serial
+            _boa_device = "kokkos"
+    except ImportError:
+        _boa_device = "cpu"
 
-    if _jax_device is None:
-        try:
-            import jax
-            _jax_device = jax.devices("cpu")[0]
-        except Exception:
-            return "cpu"
-
-    return "gpu" if _jax_device.platform == "gpu" else "cpu"
+    return _boa_device
 
 
 # -------------------------------------------------------------------
@@ -84,7 +69,7 @@ class JonesSolver(abc.ABC):
 
     def __init__(self, ref_ant: int = 0, max_iter: int = 100,
                  tol: float = 1e-10, phase_only: bool = False,
-                 backend: str = "jax", device: str = "cpu",
+                 backend: str = "boa", device: str = "kokkos",
                  feed_basis: str = "LINEAR"):
         self.ref_ant = ref_ant
         self.max_iter = max_iter
@@ -126,40 +111,6 @@ def bfs_order(adj, root):
                 visited[nb] = True
                 queue.append(nb)
     return order
-
-
-# -------------------------------------------------------------------
-# Optimizer wrappers
-# -------------------------------------------------------------------
-
-def solve_jax_bfgs(cost_fn_jax, x0, max_iter, tol):
-    """Pure JAX BFGS optimizer using jax.scipy.optimize.minimize.
-    Runs on the device chosen by detect_device (GPU if available, else CPU)."""
-    try:
-        import jax
-        import jax.numpy as jnp
-        from jax import jit
-        from jax.scipy.optimize import minimize as jax_minimize
-
-        device = _jax_device or jax.devices("cpu")[0]
-
-        @jit
-        def _minimize(x0_jax):
-            return jax_minimize(
-                cost_fn_jax, x0_jax, method="BFGS",
-                options={"maxiter": max_iter, "gtol": tol})
-
-        with jax.default_device(device):
-            x0_jax = jnp.array(x0, dtype=jnp.float64)
-            result = _minimize(x0_jax)
-            return (np.array(result.x, dtype=np.float64),
-                    float(result.fun), int(result.nit),
-                    bool(result.success))
-    except ImportError:
-        return None
-    except Exception as e:
-        logger.warning(f"JAX BFGS failed ({e}), falling back to scipy LM")
-        return None
 
 
 # -------------------------------------------------------------------

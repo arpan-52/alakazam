@@ -1,0 +1,31 @@
+[project]
+name = "alakazam"
+version = "1.0.0"
+description = "Radio interferometric calibration pipeline"
+authors = ["Arpan Pal <arpan7303@gmail.com>"]
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-arm64", "osx-64"]
+
+[tasks]
+build-boa = { cmd = "cd alakazam/boa && mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc)", description = "Build boa Kokkos solver" }
+install = { cmd = "pip install -e .", description = "Install alakazam in editable mode" }
+setup = { depends-on = ["build-boa", "install"], description = "Build boa and install alakazam" }
+run = { cmd = "alakazam run", description = "Run pipeline (pass config.yaml as argument)" }
+info = { cmd = "alakazam info", description = "Print solution file summary" }
+test = { cmd = "python -c \"from alakazam.solvers.boa_backend import import_boa; boa = import_boa(); print('boa execution space:', boa.execution_space())\"", description = "Test boa import" }
+
+[dependencies]
+python = ">=3.9"
+numpy = ">=1.24"
+scipy = ">=1.10"
+h5py = ">=3.8"
+pyyaml = ">=6.0"
+numba = ">=0.57"
+psutil = ">=5.9"
+rich = ">=13.0"
+python-casacore = ">=3.5"
+kokkos = "*"
+kokkos-kernels = "*"
+pybind11 = "*"
+cmake = ">=3.16"
+cxx-compiler = "*"

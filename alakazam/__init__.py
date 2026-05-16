@@ -3,23 +3,21 @@
 Jones types: K (parallel delay), G (gains), D (leakage),
              KC (cross delay), CP (cross phase)
 
-Solver backends: jax (default, CPU/GPU auto), scipy
-Feed bases:      LINEAR (XX/XY/YX/YY), CIRCULAR (RR/RL/LR/LL)
+Solver backend: boa (Kokkos LM — CPU/OpenMP or GPU/CUDA depending on build)
+Feed bases:     LINEAR (XX/XY/YX/YY), CIRCULAR (RR/RL/LR/LL)
 
 Developed by Arpan Pal 2026, NRAO / NCRA
 """
 
 import os as _os
-# Suppress casacore C++ ZENITH warnings and JAX TPU probes
+
+# Suppress casacore C++ ZENITH warnings
 _os.environ.setdefault("CASACORE_LOG_LEVEL", "SEVERE")
-_os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
-_os.environ.setdefault("JAX_ENABLE_X64", "True")
 
 import logging as _logging
-_logging.getLogger("jax._src.xla_bridge").setLevel(_logging.WARNING)
 
 __version__ = "1.0.0"
 __author__ = "Arpan Pal"
 
 JONES_TYPES = ("K", "G", "D", "KC", "CP")
-SOLVER_BACKENDS = ("jax", "scipy")
+SOLVER_BACKENDS = ("boa",)

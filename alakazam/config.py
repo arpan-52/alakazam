@@ -9,7 +9,7 @@ SPW syntax (CASA-native):
   0:127~156      -> SPW 0 channels 127-156 inclusive
   0:127~156,1,2,5:10~20  -> mixed
 
-Solver backends: jax (default), scipy
+Solver backend: boa (Kokkos LM)
 
 Developed by Arpan Pal 2026, NRAO / NCRA
 """
@@ -27,7 +27,7 @@ import yaml
 # ---------------------------------------------------------------------------
 
 VALID_JONES = {"K", "G", "D", "KC", "CP"}
-VALID_BACKENDS = {"ceres", "jax", "scipy"}
+VALID_BACKENDS = {"boa"}
 VALID_TIME_INTERP = {"exact", "nearest", "linear", "cubic"}
 VALID_FIELD_SELECT = {"nearest_time", "nearest_sky", "pinned"}
 
@@ -324,7 +324,7 @@ class SolveBlock:
     tol: float = 1e-10
     memory_limit_gb: float = 0.0
 
-    solver_backend: str = "ceres"
+    solver_backend: str = "boa"
     n_workers: int = 0          # 0 = auto
     gpu: bool = False           # auto-detect; True = force GPU
 
@@ -460,7 +460,7 @@ def _parse_solve_block(d: Dict[str, Any]) -> SolveBlock:
                 f"Valid: {sorted(VALID_TIME_INTERP)}")
 
     # Solver backend
-    backend = d.get("solver_backend", "ceres")
+    backend = d.get("solver_backend", "boa")
     _validate_backend(backend)
 
     # External preapply

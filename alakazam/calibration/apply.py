@@ -253,7 +253,10 @@ def _load_term(term, spw, meta, target_fname, active_names):
         return {}
     out = {}
     for fn, sol in raw.items():
-        jones = sol["jones"]
+        jones = sol["jones"].copy()
+        sol_flags = sol.get("flags")
+        if sol_flags is not None and sol_flags.any():
+            jones[sol_flags] = np.nan
         attrs = sol.get("attrs", {})
         if "ant_names" in attrs:
             sol_ant_names = json.loads(attrs["ant_names"])
