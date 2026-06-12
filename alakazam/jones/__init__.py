@@ -4,14 +4,11 @@ Developed by Arpan Pal 2026, NRAO / NCRA
 """
 
 from .algebra import (
-    FeedBasis, detect_feed_basis, corr_labels,
-    jones_multiply, jones_inverse, jones_herm,
-    unapply_rows_full, unapply_rows_full_freqdep,
-    unapply_rows_diag, unapply_rows_diag_freqdep,
+    FeedBasis, detect_feed_basis,
+    jones_multiply,
+    unapply_rows_full_freqdep, unapply_rows_diag_freqdep,
     unapply_jones_to_rows, is_diagonal_jones,
-    compute_residual_2x2, compute_residual_diag,
-    compute_residual_cross, compute_residual_diag_freq,
-    compute_residual_cross_freq, compose_jones_chain,
+    compose_jones_chain,
 )
 
 from .constructors import (

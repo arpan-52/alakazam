@@ -116,6 +116,18 @@ crs_matrix_type build_csr_leakage_ceres(
     const host_view_1d_int& h_ant2,
     const AntennaMap& amap);
 
+// Build CSR pattern for the gain solver with free ref-antenna amplitudes:
+//   phase[ref] fixed at 0 (excluded), amp_p/amp_q[ref] free — 2 params
+//   appended at end of the vector (the documented G constraint; pinning
+//   the ref amp makes the system inconsistent when the data carries a
+//   global flux factor relative to the model).
+// Total params: (n_ant-1)*4 + 2  (= amap.n_params + 2)
+// nnz_per_row: 8 for non-ref baselines, 6 for baselines involving ref.
+crs_matrix_type build_csr_gain_ref_amp(
+    const host_view_1d_int& h_ant1,
+    const host_view_1d_int& h_ant2,
+    const AntennaMap& amap);
+
 // Build CSR pattern for global-parameter solvers (KC, CP).
 //
 // n_global_params: 1 for both KC and CP.

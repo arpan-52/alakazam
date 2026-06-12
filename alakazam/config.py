@@ -326,7 +326,6 @@ class SolveBlock:
 
     solver_backend: str = "boa"
     n_workers: int = 0          # 0 = auto
-    gpu: bool = False           # auto-detect; True = force GPU
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +398,6 @@ def _ensure_list(x, n: int) -> list:
 
 
 def _validate_jones(jones_list: List[str]) -> None:
-    import re
     for j in jones_list:
         base = re.sub(r'\d+$', '', j)
         if base not in VALID_JONES:
@@ -519,7 +517,6 @@ def _parse_solve_block(d: Dict[str, Any]) -> SolveBlock:
         memory_limit_gb=float(d.get("memory_limit_gb", 0.0)),
         solver_backend=backend,
         n_workers=int(d.get("n_workers", 0)),
-        gpu=bool(d.get("gpu", False)),
     )
 
 
@@ -530,8 +527,7 @@ def _parse_fluxscale_block(d: Dict[str, Any]) -> FluxscaleBlock:
         return [str(x).strip()]
 
     jtype = d.get("jones_type", "G")
-    import re as _re
-    if _re.sub(r'\d+$', '', jtype) not in VALID_JONES:
+    if re.sub(r'\d+$', '', jtype) not in VALID_JONES:
         raise ValueError(f"fluxscale jones_type {jtype!r} not valid")
 
     return FluxscaleBlock(

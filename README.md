@@ -43,14 +43,16 @@ For GPU support or custom Kokkos builds:
 
 # 2. Build the boa solver extension
 cd alakazam/boa
-mkdir build && cd build
-cmake .. -DKokkos_ROOT=/path/to/kokkos -DKokkosKernels_ROOT=/path/to/kokkos-kernels
-make -j
+cmake -B build -DKokkos_ROOT=/path/to/kokkos -DKokkosKernels_ROOT=/path/to/kokkos-kernels
+cmake --build build -j
 
 # 3. Install the Python package
-cd ../../..
+cd ../..
 pip install -e .
 ```
+
+**Note:** install must be editable (`pip install -e .`) — the boa extension
+(`_boa.so`) is loaded from the source tree (`alakazam/boa/build/bindings/`).
 
 ### Dependencies
 
@@ -87,7 +89,13 @@ print(boa.execution_space())  # e.g., "OpenMP", "Cuda", "Serial"
 | Key | Name | Matrix | Constraint | Freq-dependent |
 |-----|------|--------|------------|----------------|
 | K | Parallel delay | `diag(e^{-2πiτ_p ν}, e^{-2πiτ_q ν})` | `τ[ref,:]=0` | Fits across freq |
-| G | Complex gains | `diag(g_p e^{iφ_p}, g_q e^{iφ_q})` | `φ[ref,:]=0`, amp free | Per freq bin |
+| G | Complex gains | `diag(g_p e^{iφ_p}, g_q e^{iφ_q})` | `φ[ref,:]=0`, all amps free (incl. ref) | Per freq bin |
+
+G has two modes: the default solves amplitudes and phases (ref amp free —
+gains can absorb a global flux factor for the unit-model fluxscale
+convention); `phase_only: true` solves only phases, with all amplitudes
+fixed at 1 inside the solver (they are not parameters).
+
 | D | Leakage | `[[1, d_pq], [d_qp, 1]]` | `d_pq[ref]=0`, `d_qp[ref]` free | Per freq bin |
 | KC | Cross-hand delay | `diag(e^{-2πiτ ν}, 1)` global | 1 parameter | Fits across freq |
 | CP | Cross-hand phase | `diag(1, e^{iφ})` global | 1 parameter | Per freq bin |
@@ -156,6 +164,12 @@ apply:
     time_interp: [nearest, linear, nearest]
 ```
 
+**Order matters**: list `jones` terms in the order they were solved
+(first-solved first). Each solution describes the residual after the terms
+before it were removed, so the applied chain is composed in the same order.
+For purely diagonal chains (K, G, KC, CP) order is immaterial; once D or
+parang is in the chain it is not.
+
 ## Time interval
 
 | Value | Meaning |
@@ -170,6 +184,11 @@ apply:
 |-------|---------|
 | `full` | Entire SPW (n_freq=1) |
 | `4MHz` | Frequency bins |
+
+When KC (cross-hand delay) is in the chain, solve D with a finite
+`freq_interval` (e.g. `4MHz`) rather than `full`: the effective leakage
+rotates with frequency under the cross-hand delay, so a full-band D
+average decorrelates by ~`|d|·sin(π τ_c B)`.
 
 ## Solution naming
 
@@ -218,6 +237,17 @@ alakazam/
 ├── core/            # MS I/O, averaging, interpolation
 ├── boa/             # Kokkos C++ solver (CMake project)
 └── io/              # HDF5 solution I/O
+```
+
+## Tests
+
+```bash
+# boa C++ unit tests (after building)
+ctest --test-dir alakazam/boa/build
+
+# End-to-end chain tests on synthetic data: builds a small MS with a known
+# Jones chain, runs solve -> fluxscale -> apply, asserts recovery vs truth.
+python tests/test_chain.py
 ```
 
 ## Examples

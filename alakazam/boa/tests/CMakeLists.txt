@@ -1,7 +1,6 @@
 # Tests for the boa solver library.
 # Uses CTest — run with: ctest --test-dir build
-
-enable_testing()
+# (enable_testing() is called in the top-level CMakeLists.txt)
 
 # Helper: add a test executable that links to libboa and registers with CTest.
 function(boa_add_test test_name)
@@ -16,6 +15,7 @@ boa_add_test(test_residual)
 boa_add_test(test_jacobian)
 boa_add_test(test_linear_solvers)
 boa_add_test(test_gain_solver)
+boa_add_test(test_gain_phase_solver)
 boa_add_test(test_delay_solver)
 boa_add_test(test_leakage_solver)
 boa_add_test(test_cross_delay_solver)

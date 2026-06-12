@@ -268,19 +268,6 @@ def raw_to_2x2(v):
     return out
 
 
-def flags_to_2x2(fl):
-    """Convert flag (*, n_corr) -> (*, 2, 2)."""
-    shape = fl.shape[:-1]
-    nc = fl.shape[-1]
-    out = np.zeros(shape + (2, 2), dtype=bool)
-    out[..., 0, 0] = fl[..., 0]
-    if nc > 2:
-        out[..., 0, 1] = fl[..., 1]
-        out[..., 1, 0] = fl[..., 2]
-    out[..., 1, 1] = fl[..., -1]
-    return out
-
-
 # -------------------------------------------------------------------
 # Write — batch optimized
 # -------------------------------------------------------------------
@@ -375,7 +362,9 @@ def compute_solint_grid(times, solint_s, scans=None):
 
     is_scan_mode = (solint_s == -1.0)
 
-    if not np.isfinite(solint_s) and not is_scan_mode and uscans is None:
+    # 'inf' spans the entire selection — one solution, ignoring scan
+    # boundaries. Per-scan solutions are requested with 'scan' (-1.0).
+    if not is_scan_mode and not np.isfinite(solint_s):
         return [utimes]
 
     blocks, block = [], [utimes[0]]

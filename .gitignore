@@ -68,6 +68,10 @@ temp/
 # pixi
 .pixi/
 
+# Claude Code local settings
+.claude/
+.code-review-graph/
+
 # boa build artifacts
 alakazam/boa/build/
 

@@ -8,6 +8,10 @@
 // Solver types and their parameterizations:
 //   solve_G  — gain (diagonal RIME, freq-independent)
 //              params: [amp_p, phase_p, amp_q, phase_q] per non-ref antenna
+//              + [amp_p_ref, amp_q_ref] (ref phases fixed, amps free)
+//   solve_Gp — phase-only gain (diagonal RIME, freq-independent)
+//              params: [phase_p, phase_q] per non-ref antenna; ALL amps
+//              fixed at 1 (they are not parameters), phase[ref]=0
 //   solve_K  — delay (diagonal RIME, freq-dependent)
 //              params: [tau_p_ns, tau_q_ns] per non-ref antenna
 //   solve_D  — leakage (full 2x2 RIME, freq-independent)
@@ -35,6 +39,15 @@ namespace boa {
 // vis_obs, vis_model: (n_bl, 4) complex.
 // freqs: ignored (pass empty view).
 SolverResult solve_G(const SolverInput& inp, const SolverOptions& opts);
+
+// ---------------------------------------------------------------------------
+// solve_Gp — phase-only gain calibration
+// ---------------------------------------------------------------------------
+// Solves for diagonal Jones J = diag(exp(i*phase_p), exp(i*phase_q)) with
+// all amplitudes fixed at 1 (amps are not parameters). phase[ref]=0.
+// vis_obs, vis_model: (n_bl, 4) complex.
+// freqs: ignored (pass empty view).
+SolverResult solve_Gp(const SolverInput& inp, const SolverOptions& opts);
 
 // ---------------------------------------------------------------------------
 // solve_K — delay calibration

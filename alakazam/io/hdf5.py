@@ -43,7 +43,7 @@ MATRIX_FORMS = {
 
 REF_ANT_CONSTRAINTS = {
     "K":  "delay[ref,:]=0",
-    "G":  "phase[ref,:]=0, amp free",
+    "G":  "phase[ref,:]=0, all amps free (phase_only: amps fixed at 1)",
     "D":  "d_pq[ref]=0, d_qp[ref] free",
     "KC": "none (single global param)",
     "CP": "none (single global param)",
@@ -274,6 +274,21 @@ def list_jones_types(path):
     with h5py.File(path, "r") as f:
         return [k for k in f.keys() if k not in ("metadata", "fluxscale")]
 
+def delete_jones_keys(path, jones_keys):
+    """Delete top-level jones groups (e.g. before a fresh solve rewrites them).
+
+    The solution file is append-mode; without this, solutions from a previous
+    run with a different field/scan selection would survive under the same
+    key and leak into preapply/apply.
+    """
+    if not _exists(path):
+        return
+    with h5py.File(path, "a") as f:
+        for k in jones_keys:
+            if k in f:
+                del f[k]
+                logger.info(f"Removed stale solutions {k!r} from {path}")
+
 def list_spws(path, jones_type, field_name):
     """List SPW ids, handling scan-level hierarchy."""
     with h5py.File(path, "r") as f:
@@ -293,6 +308,8 @@ def list_spws(path, jones_type, field_name):
         return sorted(spws)
 
 def copy_solutions(src, dst):
+    if os.path.abspath(src) == os.path.abspath(dst):
+        return  # in-place fluxscale: output is the transfer table itself
     mode = "a" if _exists(dst) else "w"
     with h5py.File(src, "r") as s, h5py.File(dst, mode) as d:
         for k in s.keys():
@@ -304,30 +321,40 @@ def rescale_solutions(path, jones_type, field_name, spw, factor_p, factor_q):
 
     factor_p / factor_q are direct amplitude multipliers applied to
     the Jones diagonal (no sqrt taken internally).
+
+    Marks each rescaled group with a 'fluxscale_applied' attr and refuses
+    to rescale twice — the multiplication is in-place, so a second pass
+    would silently square the scale. Re-run the solve to reset.
     """
+    def _rescale_group(g, gpath):
+        if g.attrs.get("fluxscale_applied", False):
+            raise ValueError(
+                f"{gpath} in {path} already has fluxscale applied "
+                f"(scale_p={g.attrs.get('fluxscale_p', '?')}). "
+                f"Re-run the solve before running fluxscale again.")
+        j = g["jones"][:]
+        j[..., 0, 0] *= factor_p
+        j[..., 1, 1] *= factor_q
+        g["jones"][...] = j
+        g.attrs["fluxscale_applied"] = True
+        g.attrs["fluxscale_p"] = factor_p
+        g.attrs["fluxscale_q"] = factor_q
+
     with h5py.File(path, "a") as f:
         fk = f"{jones_type}/{_fk(field_name)}"
         if fk not in f:
             raise KeyError(f"Not found: {fk}")
         fg = f[fk]
         rescaled = False
+        sk = _sk(spw)
         for key in fg.keys():
             if key.startswith("scan_"):
-                sk = _sk(spw)
                 if sk in fg[key] and "jones" in fg[key][sk]:
-                    jpath = f"{fk}/{key}/{sk}/jones"
-                    j = f[jpath][:]
-                    j[..., 0, 0] *= factor_p
-                    j[..., 1, 1] *= factor_q
-                    f[jpath][...] = j
+                    _rescale_group(fg[key][sk], f"{fk}/{key}/{sk}")
                     rescaled = True
-            elif key == _sk(spw) and "jones" in fg[key]:
+            elif key == sk and "jones" in fg[key]:
                 # Legacy layout
-                jpath = f"{fk}/{key}/jones"
-                j = f[jpath][:]
-                j[..., 0, 0] *= factor_p
-                j[..., 1, 1] *= factor_q
-                f[jpath][...] = j
+                _rescale_group(fg[key], f"{fk}/{key}")
                 rescaled = True
         if not rescaled:
             raise KeyError(f"No jones data found for {fk}/spw_{spw}")

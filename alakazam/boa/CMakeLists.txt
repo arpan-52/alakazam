@@ -7,6 +7,9 @@ project(boa CXX)
 find_package(Kokkos REQUIRED)
 find_package(KokkosKernels REQUIRED)
 
+# Must be called at the top level so `ctest --test-dir build` finds the tests.
+enable_testing()
+
 add_subdirectory(cpp)
 add_subdirectory(tests)
 

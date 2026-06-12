@@ -361,4 +361,77 @@ crs_matrix_type build_csr_leakage_ceres(
     return J;
 }
 
+// ---------------------------------------------------------------------------
+// build_csr_gain_ref_amp
+// ---------------------------------------------------------------------------
+// Gain solver with free ref-antenna amplitudes (phases fixed at 0):
+// Param layout: [(n_ant-1)*4 params for non-ref ants] + [amp_p_ref, amp_q_ref]
+// Total columns: amap.n_params + 2
+//
+// nnz per row:
+//   neither ant is ref → 8 (4+4)
+//   one ant is ref     → 6 (2 ref amp cols + 4 for non-ref ant)
+
+crs_matrix_type build_csr_gain_ref_amp(
+    const host_view_1d_int& h_ant1,
+    const host_view_1d_int& h_ant2,
+    const AntennaMap& amap)
+{
+    const int n_bl        = static_cast<int>(h_ant1.extent(0));
+    const int ref_amp_off = amap.n_params;          // (n_ant-1)*4
+    const int n_cols      = amap.n_params + 2;
+    const int res_per_bl  = 4;
+    const int n_rows      = n_bl * res_per_bl;
+
+    std::vector<int> row_ptr(n_rows + 1, 0);
+    int total_nnz = 0;
+
+    for (int b = 0; b < n_bl; ++b) {
+        const int off_i = amap.h_ant_to_param(h_ant1(b));
+        const int off_j = amap.h_ant_to_param(h_ant2(b));
+        const int nnz_row = (off_i >= 0 ? 4 : 2) + (off_j >= 0 ? 4 : 2);
+        for (int r = 0; r < res_per_bl; ++r)
+            row_ptr[b * res_per_bl + r + 1] = nnz_row;
+        total_nnz += res_per_bl * nnz_row;
+    }
+
+    for (int i = 0; i < n_rows; ++i) row_ptr[i + 1] += row_ptr[i];
+
+    std::vector<int> col_ind(total_nnz);
+    for (int b = 0; b < n_bl; ++b) {
+        const int off_i = amap.h_ant_to_param(h_ant1(b));
+        const int off_j = amap.h_ant_to_param(h_ant2(b));
+        for (int r = 0; r < res_per_bl; ++r) {
+            int pos = row_ptr[b * res_per_bl + r];
+            if (off_i >= 0) {
+                for (int k = 0; k < 4; ++k) col_ind[pos++] = off_i + k;
+            } else {
+                col_ind[pos++] = ref_amp_off;       // amp_p
+                col_ind[pos++] = ref_amp_off + 1;   // amp_q
+            }
+            if (off_j >= 0) {
+                for (int k = 0; k < 4; ++k) col_ind[pos++] = off_j + k;
+            } else {
+                col_ind[pos++] = ref_amp_off;
+                col_ind[pos++] = ref_amp_off + 1;
+            }
+        }
+    }
+
+    host_row_map_type h_row_ptr("h_row_ptr", n_rows + 1);
+    host_entries_type h_col_ind("h_col_ind", total_nnz);
+    for (int i = 0; i <= n_rows; ++i) h_row_ptr(i) = row_ptr[i];
+    for (int i = 0; i < total_nnz; ++i) h_col_ind(i) = col_ind[i];
+
+    Kokkos::View<int*, mem_space> d_row_ptr("d_row_ptr", n_rows + 1);
+    Kokkos::View<int*, mem_space> d_col_ind("d_col_ind", total_nnz);
+    view_1d_real d_values("d_values", total_nnz);
+    Kokkos::deep_copy(d_row_ptr, h_row_ptr);
+    Kokkos::deep_copy(d_col_ind, h_col_ind);
+
+    crs_matrix_type J("J", n_rows, n_cols, total_nnz,
+                      d_values, d_row_ptr, d_col_ind);
+    return J;
+}
+
 }  // namespace boa

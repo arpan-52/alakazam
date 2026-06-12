@@ -10,5 +10,4 @@ from .averaging import (average_per_baseline_full,
                         average_per_baseline_time_only)
 from .interpolation import (interpolate_jones, interpolate_jones_multifield,
                             interpolate_delay)
-from .memory import (get_available_ram_gb, get_available_vram_gb,
-                     estimate_slot_memory_gb, tier_strategy)
+from .memory import get_available_ram_gb

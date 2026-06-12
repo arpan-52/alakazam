@@ -31,6 +31,30 @@ void fill_jacobian_gain(
     int n_bl,
     int params_per_ant);
 
+// Phase-only gain Jacobian: amps fixed at 1 (not parameters),
+// 2 columns per non-ref antenna: [phase_p, phase_q]. Ref excluded entirely.
+void fill_jacobian_gain_phase(
+    crs_matrix_type& J,
+    const view_1d_real& params,
+    const view_2d_complex& vis_model,
+    const view_1d_int& ant1,
+    const view_1d_int& ant2,
+    const view_1d_int& ant_to_param,
+    int n_bl);
+
+// Gain Jacobian with free ref-antenna amplitudes:
+//   phase[ref] fixed at 0 (no columns), amp_p/amp_q[ref] free
+//   (2 cols at ref_amp_off / ref_amp_off+1).
+void fill_jacobian_gain_ref_amp(
+    crs_matrix_type& J,
+    const view_1d_real& params,
+    const view_2d_complex& vis_model,
+    const view_1d_int& ant1,
+    const view_1d_int& ant2,
+    const view_1d_int& ant_to_param,
+    int ref_amp_off,
+    int n_bl);
+
 // ---------------------------------------------------------------------------
 // Delay solver Jacobian fill (freq-dependent)
 // ---------------------------------------------------------------------------

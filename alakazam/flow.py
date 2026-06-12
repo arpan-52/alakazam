@@ -16,7 +16,7 @@ Developed by Arpan Pal 2026, NRAO / NCRA
 """
 
 from __future__ import annotations
-import gc, json, logging, os, time as _time
+import atexit, gc, json, logging, multiprocessing, os, time as _time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 import numpy as np
@@ -34,7 +34,7 @@ from .core.averaging import (average_per_baseline_full,
 from .core.memory import get_available_ram_gb
 from .core.interpolation import interpolate_jones_multifield
 from .solvers import get_solver, detect_device
-from .io.hdf5 import save_solutions, load_all_fields
+from .io.hdf5 import save_solutions, load_all_fields, delete_jones_keys
 from .calibration.fluxscale import run_fluxscale
 from .calibration.apply import apply_calibration
 from .jones.algebra import (compose_jones_chain, unapply_jones_to_rows,
@@ -108,6 +108,42 @@ def _log(msg, style=""):
     elif _con: _con.print(msg)
 
 
+# Persistent worker pool for per-cell solves. Uses spawn, not fork: the
+# parent process initializes Kokkos/OpenMP when boa is imported, and forking
+# after OpenMP init is undefined behaviour (works with libgomp on Linux,
+# deadlocks with llvm libomp on macOS). Each worker pins OMP_NUM_THREADS=1
+# before importing boa so n_workers processes don't oversubscribe the CPU.
+_pool: Optional[ProcessPoolExecutor] = None
+_pool_size = 0
+
+
+def _worker_init():
+    os.environ["OMP_NUM_THREADS"] = "1"
+
+
+def _get_pool(n_workers: int) -> ProcessPoolExecutor:
+    global _pool, _pool_size
+    if _pool is None or _pool_size < n_workers:
+        if _pool is not None:
+            _pool.shutdown(wait=True)
+        _pool = ProcessPoolExecutor(
+            max_workers=n_workers,
+            mp_context=multiprocessing.get_context("spawn"),
+            initializer=_worker_init)
+        _pool_size = n_workers
+    return _pool
+
+
+def _shutdown_pool():
+    global _pool
+    if _pool is not None:
+        _pool.shutdown(wait=False)
+        _pool = None
+
+
+atexit.register(_shutdown_pool)
+
+
 # ============================================================
 # PUBLIC
 # ============================================================
@@ -160,8 +196,8 @@ def _run_solve_block(sb: SolveBlock) -> None:
     ref_remapped = ant_remap[sb.ref_ant]
     _log(f"  Reference antenna: {meta.ant_names[sb.ref_ant]} (index {ref_remapped})")
 
-    device = detect_device(sb.solver_backend, sb.gpu)
-    _dev_style = "bold green" if device == "gpu" else "yellow"
+    device = detect_device(sb.solver_backend)
+    _dev_style = "bold green" if device.lower() in ("cuda", "hip") else "yellow"
     _log(f"  Backend: {sb.solver_backend}  Device: {device}", _dev_style)
 
     # Detect feed basis once for the whole solve block
@@ -171,19 +207,24 @@ def _run_solve_block(sb: SolveBlock) -> None:
     global_spws = spw_ids_from_selection(sb.spw)
     if global_spws is None: global_spws = list(range(meta.n_spw))
 
+    # Build unique keys: K0, G0, G1, G2, D0, ...
+    type_counter: Dict[str, int] = {}
+    jones_keys = []
+    for jt in sb.jones:
+        idx = type_counter.get(jt, 0)
+        type_counter[jt] = idx + 1
+        jones_keys.append(f"{jt}{idx}")
+
+    # Remove stale solutions for the keys this block will write — the output
+    # file is append-mode, so leftovers from a previous run with different
+    # fields/scans would otherwise leak into the preapply chain and apply.
+    delete_jones_keys(sb.output, jones_keys)
+
     for spw in global_spws:
         freqs_full = meta.spw_freqs[spw]
         _log(f"\n  SPW {spw}: {len(freqs_full)} channels, "
              f"{freqs_full[0]/1e6:.1f}–{freqs_full[-1]/1e6:.1f} MHz")
         internal_stack: Dict[str, Dict] = {}
-
-        # Build unique keys: K0, G0, G1, G2, D0, ...
-        type_counter: Dict[str, int] = {}
-        jones_keys = []
-        for jt in sb.jones:
-            idx = type_counter.get(jt, 0)
-            type_counter[jt] = idx + 1
-            jones_keys.append(f"{jt}{idx}")
 
         for step_idx, jones_type in enumerate(sb.jones):
             jones_key = jones_keys[step_idx]
@@ -314,7 +355,7 @@ def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
     cost_grid = np.zeros((n_freq, n_time), dtype=np.float64)
     freq_centres = np.array([float(np.mean(fb)) for fb in freq_bins])
     n_workers = sb.n_workers if sb.n_workers > 0 else max(
-        1, min(os.cpu_count() - 1, n_freq * n_time))
+        1, min((os.cpu_count() or 2) - 1, n_freq * n_time))
 
     # ---- 5. PROCESS EACH TIME_BIN ----
     for ti in range(n_time):
@@ -370,11 +411,12 @@ def _solve_one_field(sb, step_idx, jones_type, field_name, field_scans,
                     J_pre_t3, preapply_flagged_t3 = entry
 
             unique_t = np.sort(np.unique(tb))
+            rows_per_ts = _rows_per_timestamp(row_times_all)
             ci = 0
             while ci < len(unique_t):
                 ce, est = ci, 0
                 while ce < len(unique_t):
-                    tr = sum(1 for t in row_times_all if t == unique_t[ce])
+                    tr = rows_per_ts.get(unique_t[ce], 0)
                     if est + tr > max_rows_per_load and est > 0: break
                     est += tr; ce += 1
                 if ce == ci: ce = ci + 1
@@ -579,21 +621,21 @@ def _solve_tasks(tasks, solver, n_ant, n_workers,
         return
 
     if n_workers > 1 and n_valid > 1:
-        with ProcessPoolExecutor(max_workers=n_workers) as pool:
-            futs = {pool.submit(_solve_single_cell, solver, t, n_ant):
-                    (t["fi"], t["ti"]) for t in valid_tasks}
-            for fut in as_completed(futs):
-                fi, ti = futs[fut]
-                try:
-                    r = fut.result()
-                    status = "converged" if r.get('converged') else "FAILED"
-                    logger.debug(f"          cell ({fi},{ti}): "
-                                 f"{status}  iter={r.get('n_iter',0)} "
-                                 f"cost={r.get('cost',0):.2e}  "
-                                 f"{r.get('wall_time',0):.1f}s")
-                    _store(fi, ti, r)
-                except Exception as e:
-                    logger.error(f"      cell ({fi},{ti}): {e}")
+        pool = _get_pool(n_workers)
+        futs = {pool.submit(_solve_single_cell, solver, t, n_ant):
+                (t["fi"], t["ti"]) for t in valid_tasks}
+        for fut in as_completed(futs):
+            fi, ti = futs[fut]
+            try:
+                r = fut.result()
+                status = "converged" if r.get('converged') else "FAILED"
+                logger.debug(f"          cell ({fi},{ti}): "
+                             f"{status}  iter={r.get('n_iter',0)} "
+                             f"cost={r.get('cost',0):.2e}  "
+                             f"{r.get('wall_time',0):.1f}s")
+                _store(fi, ti, r)
+            except Exception as e:
+                logger.error(f"      cell ({fi},{ti}): {e}")
     else:
         for task in valid_tasks:
             try:
@@ -732,33 +774,19 @@ def _is_preapply_flagged(bad_mask, fi, n_raw_chans=1):
     return bad_mask[:, fi].any()
 
 
+def _rows_per_timestamp(row_times_all):
+    """Map unique timestamp -> number of MS rows at that timestamp."""
+    uniq, counts = np.unique(row_times_all, return_counts=True)
+    return dict(zip(uniq.tolist(), counts.tolist()))
+
+
 def _compute_rows_per_tbin(row_times_all, time_bins):
-    """Vectorized rows-per-tbin using searchsorted + bincount."""
+    """Count MS rows falling in each time bin."""
     if not time_bins:
         return []
-    # Build a flat array of all unique bin times and map each to a bin index
-    all_unique = np.unique(row_times_all)
-    # For each unique time, find which bin it belongs to
-    bin_edges = []
-    for tb in time_bins:
-        bin_edges.append((tb.min(), tb.max()))
-
-    # Simple approach: map each row time to its bin
-    n_bins = len(time_bins)
-    # Build set lookup for each bin
-    bin_sets = [set(tb.tolist()) for tb in time_bins]
-
-    # Build a mapping: unique_time -> bin_index
-    time_to_bin = {}
-    for bi, ts_set in enumerate(bin_sets):
-        for t in ts_set:
-            time_to_bin[t] = bi
-
-    # Vectorized: map row times to bin indices using the dict
-    bin_idx = np.array([time_to_bin.get(t, -1) for t in row_times_all], dtype=np.int64)
-    valid = bin_idx >= 0
-    counts = np.bincount(bin_idx[valid], minlength=n_bins)
-    return counts.tolist()
+    count_of = _rows_per_timestamp(row_times_all)
+    return [int(sum(count_of.get(t, 0) for t in tb.tolist()))
+            for tb in time_bins]
 
 
 def _compute_preapply_at_tmids(sb, step_idx, field_name, spw, freqs,
@@ -866,7 +894,6 @@ def _flag_solutions(jones):
     has_bad = np.any(np.isnan(flat) | np.isinf(flat), axis=(-2, -1))
     det = np.abs(flat[..., 0, 0] * flat[..., 1, 1] - flat[..., 0, 1] * flat[..., 1, 0])
     fl = has_bad | (det < 1e-20)
-    n = fl.sum()
     return fl.reshape(fshape)
 
 

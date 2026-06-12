@@ -14,8 +14,6 @@ import os as _os
 # Suppress casacore C++ ZENITH warnings
 _os.environ.setdefault("CASACORE_LOG_LEVEL", "SEVERE")
 
-import logging as _logging
-
 __version__ = "1.0.0"
 __author__ = "Arpan Pal"
 

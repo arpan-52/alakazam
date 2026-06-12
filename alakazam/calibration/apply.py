@@ -257,16 +257,19 @@ def _load_term(term, spw, meta, target_fname, active_names):
         sol_flags = sol.get("flags")
         if sol_flags is not None and sol_flags.any():
             jones[sol_flags] = np.nan
+        delay = sol.get("delay")
+        if delay is not None and sol_flags is not None and sol_flags.any():
+            # Flagged delay cells are stored as 0.0 ns — NaN them so the
+            # delay interpolator excludes them instead of applying zero delay.
+            delay = delay.copy()
+            delay[sol_flags] = np.nan
         attrs = sol.get("attrs", {})
         if "ant_names" in attrs:
             sol_ant_names = json.loads(attrs["ant_names"])
             if sol_ant_names != active_names:
                 jones = _remap_jones(jones, sol_ant_names, active_names)
-        delay = sol.get("delay")
-        if delay is not None and "ant_names" in attrs:
-            sol_ant_names = json.loads(attrs["ant_names"])
-            if sol_ant_names != active_names:
-                delay = _remap_delay(delay, sol_ant_names, active_names)
+                if delay is not None:
+                    delay = _remap_delay(delay, sol_ant_names, active_names)
         out[fn] = {
             "times": sol["time"], "freqs": sol.get("freq"),
             "jones": jones, "delay": delay,
