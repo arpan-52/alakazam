@@ -35,18 +35,37 @@ struct GainProblem {
     AntennaMap amap;
     int n_bl;
     int n_ant;
+    // Ref convention: phase[ref]=0 (excluded), amp_p/amp_q[ref] free at
+    // this offset. Pinning the ref amp makes the amplitude system
+    // inconsistent when the data carries a global flux factor relative to
+    // the model (the unit-model fluxscale convention).
+    // ref_amp_off = amap.n_params = (n_ant-1)*4
+    int ref_amp_off;
 
     int n_residuals() const { return n_bl * GainParam::residuals_per_bl; }
-    int n_params()    const { return amap.n_params; }
+    // Total params: (n_ant-1)*4 + 2  (non-ref ants: 4 each, ref amps: 2)
+    int n_params()    const { return ref_amp_off + 2; }
 
     crs_matrix_type build_csr_pattern() const {
-        return build_csr_diagonal(h_ant1, h_ant2, amap, 1);
+        return build_csr_gain_ref_amp(h_ant1, h_ant2, amap);
     }
 
-    // Initial params: identity gain for all non-ref antennas: amp=1, phase=0.
+    // Unpack one antenna's [amp_p, phase_p, amp_q, phase_q] from the
+    // parameter vector, handling the ref antenna's free-amp layout.
+    template <typename HostParams>
+    void unpack_ant(const HostParams& h_p, int a, real_type pi[4]) const {
+        const int off = amap.h_ant_to_param(a);
+        if (off >= 0) {
+            for (int k = 0; k < 4; ++k) pi[k] = h_p(off + k);
+        } else {
+            pi[0] = h_p(ref_amp_off);     pi[1] = 0.0;
+            pi[2] = h_p(ref_amp_off + 1); pi[3] = 0.0;
+        }
+    }
+
+    // Initial params: identity gain everywhere (ref amps = 1).
     view_1d_real initial_params() const {
-        const int n = amap.n_params;
-        view_1d_real p("g_init", n);
+        view_1d_real p("g_init", n_params());
         auto h = Kokkos::create_mirror_view(p);
         for (int a = 0; a < n_ant; ++a) {
             const int off = amap.h_ant_to_param(a);
@@ -56,6 +75,8 @@ struct GainProblem {
             h(off + 2) = 1.0;  // amp_q
             h(off + 3) = 0.0;  // phase_q
         }
+        h(ref_amp_off) = 1.0;
+        h(ref_amp_off + 1) = 1.0;
         Kokkos::deep_copy(p, h);
         return p;
     }
@@ -69,9 +90,8 @@ struct GainProblem {
         auto h_p  = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), params);
 
         for (int a = 0; a < n_ant; ++a) {
-            real_type pi[4] = {1.0, 0.0, 1.0, 0.0};
-            const int off = amap.h_ant_to_param(a);
-            if (off >= 0) for (int k = 0; k < 4; ++k) pi[k] = h_p(off + k);
+            real_type pi[4];
+            unpack_ant(h_p, a, pi);
             complex_type gpi, gqi;
             GainParam::params_to_diagonal(pi, gpi, gqi);
             h_gp(a) = gpi;
@@ -83,8 +103,8 @@ struct GainProblem {
     }
 
     void fill_jacobian(const view_1d_real& params, crs_matrix_type& J) const {
-        fill_jacobian_gain(J, params, vis_model, ant1, ant2,
-                           ant_to_param, n_bl, GainParam::params_per_ant);
+        fill_jacobian_gain_ref_amp(J, params, vis_model, ant1, ant2,
+                                   ant_to_param, ref_amp_off, n_bl);
     }
 
     // Convert params to Jones matrix (n_ant x 4 complex, flattened 2x2).
@@ -93,9 +113,8 @@ struct GainProblem {
         auto h_j = Kokkos::create_mirror_view(jones);
         auto h_p = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), params);
         for (int a = 0; a < n_ant; ++a) {
-            real_type pi[4] = {1.0, 0.0, 1.0, 0.0};
-            const int off = amap.h_ant_to_param(a);
-            if (off >= 0) for (int k = 0; k < 4; ++k) pi[k] = h_p(off + k);
+            real_type pi[4];
+            unpack_ant(h_p, a, pi);
             complex_type gp, gq;
             GainParam::params_to_diagonal(pi, gp, gq);
             // Diagonal Jones: [[gp, 0], [0, gq]] → flattened [gp, 0, 0, gq]
@@ -118,6 +137,104 @@ SolverResult solve_G(const SolverInput& inp, const SolverOptions& opts)
     auto h_ant2 = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), inp.ant2);
 
     GainProblem prob;
+    prob.vis_obs      = inp.vis_obs;
+    prob.vis_model    = inp.vis_model;
+    prob.ant1         = inp.ant1;
+    prob.ant2         = inp.ant2;
+    prob.ant_to_param = amap.ant_to_param;
+    prob.h_ant1       = h_ant1;
+    prob.h_ant2       = h_ant2;
+    prob.amap         = amap;
+    prob.n_bl         = n_bl;
+    prob.n_ant        = inp.n_ant;
+    prob.ref_amp_off  = amap.n_params;   // = (n_ant-1)*4
+
+    return solve_lm(prob, opts, inp.init_params);
+}
+
+// ===========================================================================
+// GainPhaseProblem — phase-only gains: diagonal RIME, freq-independent
+// ===========================================================================
+// All amplitudes fixed at 1 (not parameters). 2 params per non-ref antenna:
+// [phase_p, phase_q]. Ref antenna fully excluded (phase 0, amp 1).
+
+struct GainPhaseProblem {
+    view_2d_complex vis_obs;
+    view_2d_complex vis_model;
+    view_1d_int     ant1;
+    view_1d_int     ant2;
+    view_1d_int     ant_to_param;
+    host_view_1d_int h_ant1;
+    host_view_1d_int h_ant2;
+    AntennaMap amap;   // params_per_ant = 2
+    int n_bl;
+    int n_ant;
+
+    int n_residuals() const { return n_bl * GainParam::residuals_per_bl; }
+    int n_params()    const { return amap.n_params; }
+
+    crs_matrix_type build_csr_pattern() const {
+        return build_csr_diagonal(h_ant1, h_ant2, amap, 1);
+    }
+
+    // Initial params: zero phases.
+    view_1d_real initial_params() const {
+        view_1d_real p("gp_init", amap.n_params);
+        Kokkos::deep_copy(p, real_type(0.0));
+        return p;
+    }
+
+    void build_residual(const view_1d_real& params, view_1d_real& r) const {
+        view_1d_complex g_p("g_p", n_ant);
+        view_1d_complex g_q("g_q", n_ant);
+        auto h_gp = Kokkos::create_mirror_view(g_p);
+        auto h_gq = Kokkos::create_mirror_view(g_q);
+        auto h_p  = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), params);
+
+        for (int a = 0; a < n_ant; ++a) {
+            real_type php = 0.0, phq = 0.0;
+            const int off = amap.h_ant_to_param(a);
+            if (off >= 0) { php = h_p(off); phq = h_p(off + 1); }
+            h_gp(a) = complex_type(std::cos(php), std::sin(php));
+            h_gq(a) = complex_type(std::cos(phq), std::sin(phq));
+        }
+        Kokkos::deep_copy(g_p, h_gp);
+        Kokkos::deep_copy(g_q, h_gq);
+        build_residual_diagonal(r, g_p, g_q, vis_obs, vis_model, ant1, ant2, n_bl);
+    }
+
+    void fill_jacobian(const view_1d_real& params, crs_matrix_type& J) const {
+        fill_jacobian_gain_phase(J, params, vis_model, ant1, ant2,
+                                 ant_to_param, n_bl);
+    }
+
+    view_2d_complex params_to_jones(const view_1d_real& params) const {
+        view_2d_complex jones("jones_Gp", n_ant, 4);
+        auto h_j = Kokkos::create_mirror_view(jones);
+        auto h_p = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), params);
+        for (int a = 0; a < n_ant; ++a) {
+            real_type php = 0.0, phq = 0.0;
+            const int off = amap.h_ant_to_param(a);
+            if (off >= 0) { php = h_p(off); phq = h_p(off + 1); }
+            h_j(a, 0) = complex_type(std::cos(php), std::sin(php));
+            h_j(a, 1) = complex_type(0.0, 0.0);
+            h_j(a, 2) = complex_type(0.0, 0.0);
+            h_j(a, 3) = complex_type(std::cos(phq), std::sin(phq));
+        }
+        Kokkos::deep_copy(jones, h_j);
+        return jones;
+    }
+};
+
+SolverResult solve_Gp(const SolverInput& inp, const SolverOptions& opts)
+{
+    const int n_bl = inp.ant1.extent(0);
+    AntennaMap amap = build_antenna_map(inp.n_ant, inp.ref_ant, 2);
+
+    auto h_ant1 = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), inp.ant1);
+    auto h_ant2 = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), inp.ant2);
+
+    GainPhaseProblem prob;
     prob.vis_obs      = inp.vis_obs;
     prob.vis_model    = inp.vis_model;
     prob.ant1         = inp.ant1;

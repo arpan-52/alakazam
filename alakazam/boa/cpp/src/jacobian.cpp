@@ -73,6 +73,134 @@ void fill_jacobian_gain(
 }
 
 // ---------------------------------------------------------------------------
+// Phase-only gain solver
+// ---------------------------------------------------------------------------
+// Amps fixed at 1 (not parameters). 2 columns per non-ref antenna:
+// [phase_p, phase_q]. Ref antenna has no columns (phase 0, amp 1).
+// Reuses GainParam::jacobian_one_row with unit amps and extracts the
+// phase derivatives (indices 1 and 3 of the 4-param gain block).
+
+void fill_jacobian_gain_phase(
+    crs_matrix_type& J,
+    const view_1d_real& params,
+    const view_2d_complex& vis_model,
+    const view_1d_int& ant1,
+    const view_1d_int& ant2,
+    const view_1d_int& ant_to_param,
+    int n_bl)
+{
+    auto row_map = J.graph.row_map;
+    auto values  = J.values;
+
+    Kokkos::parallel_for("fill_jacobian_gain_phase", n_bl,
+        KOKKOS_LAMBDA(const int b) {
+            const int ai    = ant1(b);
+            const int aj    = ant2(b);
+            const int off_i = ant_to_param(ai);
+            const int off_j = ant_to_param(aj);
+
+            // [amp_p=1, phase_p, amp_q=1, phase_q]
+            real_type pi[4]; pi[0] = 1.0; pi[1] = 0.0; pi[2] = 1.0; pi[3] = 0.0;
+            real_type pj[4]; pj[0] = 1.0; pj[1] = 0.0; pj[2] = 1.0; pj[3] = 0.0;
+            if (off_i >= 0) { pi[1] = params(off_i); pi[3] = params(off_i + 1); }
+            if (off_j >= 0) { pj[1] = params(off_j); pj[3] = params(off_j + 1); }
+
+            for (int r = 0; r < 4; ++r) {
+                const int row = b * 4 + r;
+                const int pol = r / 2;
+                const bool is_real = (r % 2 == 0);
+                const complex_type model_val = vis_model(b, pol * 3);
+
+                real_type vals_i[4], vals_j[4];
+                GainParam::jacobian_one_row(vals_i, vals_j, pi, pj,
+                                            model_val, pol, is_real);
+
+                int pos = row_map(row);
+                if (off_i >= 0) {
+                    values(pos++) = vals_i[1];   // d/d phase_p
+                    values(pos++) = vals_i[3];   // d/d phase_q
+                }
+                if (off_j >= 0) {
+                    values(pos++) = vals_j[1];
+                    values(pos++) = vals_j[3];
+                }
+            }
+        });
+    Kokkos::fence("fill_jacobian_gain_phase_fence");
+}
+
+// ---------------------------------------------------------------------------
+// Gain solver with free ref-antenna amplitudes
+// ---------------------------------------------------------------------------
+// phase[ref] fixed at 0 (no columns); amp_p/amp_q[ref] free, stored at
+// params[ref_amp_off] / params[ref_amp_off + 1].
+// CSR layout per baseline involving ref: 2 ref amp cols + 4 for the other ant.
+
+void fill_jacobian_gain_ref_amp(
+    crs_matrix_type& J,
+    const view_1d_real& params,
+    const view_2d_complex& vis_model,
+    const view_1d_int& ant1,
+    const view_1d_int& ant2,
+    const view_1d_int& ant_to_param,
+    int ref_amp_off,
+    int n_bl)
+{
+    auto row_map = J.graph.row_map;
+    auto values  = J.values;
+
+    Kokkos::parallel_for("fill_jacobian_gain_ref_amp", n_bl,
+        KOKKOS_LAMBDA(const int b) {
+            const int ai    = ant1(b);
+            const int aj    = ant2(b);
+            const int off_i = ant_to_param(ai);
+            const int off_j = ant_to_param(aj);
+
+            // Ref antenna: free amps, phases pinned to 0.
+            real_type pi[4]; real_type pj[4];
+            if (off_i >= 0) {
+                for (int k = 0; k < 4; ++k) pi[k] = params(off_i + k);
+            } else {
+                pi[0] = params(ref_amp_off);     pi[1] = 0.0;
+                pi[2] = params(ref_amp_off + 1); pi[3] = 0.0;
+            }
+            if (off_j >= 0) {
+                for (int k = 0; k < 4; ++k) pj[k] = params(off_j + k);
+            } else {
+                pj[0] = params(ref_amp_off);     pj[1] = 0.0;
+                pj[2] = params(ref_amp_off + 1); pj[3] = 0.0;
+            }
+
+            for (int r = 0; r < 4; ++r) {
+                const int row = b * 4 + r;
+                const int pol = r / 2;
+                const bool is_real = (r % 2 == 0);
+                const complex_type model_val = vis_model(b, pol * 3);
+
+                real_type vals_i[4], vals_j[4];
+                GainParam::jacobian_one_row(vals_i, vals_j, pi, pj,
+                                            model_val, pol, is_real);
+
+                int pos = row_map(row);
+                if (off_i >= 0) {
+                    for (int k = 0; k < 4; ++k) values(pos++) = vals_i[k];
+                } else {
+                    // ref: amp columns only (indices 0 = amp_p, 2 = amp_q)
+                    values(pos++) = vals_i[0];
+                    values(pos++) = vals_i[2];
+                }
+                if (off_j >= 0) {
+                    for (int k = 0; k < 4; ++k) values(pos++) = vals_j[k];
+                } else {
+                    values(pos++) = vals_j[0];
+                    values(pos++) = vals_j[2];
+                }
+            }
+        });
+    Kokkos::fence("fill_jacobian_gain_ref_amp_fence");
+}
+
+// ---------------------------------------------------------------------------
 // Delay solver: diagonal RIME, freq-dependent
 // ---------------------------------------------------------------------------
 // Residual layout: baseline-major, freq within baseline, 4 reals per freq.

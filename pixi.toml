@@ -7,12 +7,14 @@ channels = ["conda-forge"]
 platforms = ["linux-64", "osx-arm64", "osx-64"]
 
 [tasks]
-build-boa = { cmd = "cd alakazam/boa && mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc)", description = "Build boa Kokkos solver" }
+build-boa = { cmd = "cd alakazam/boa && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j", description = "Build boa Kokkos solver" }
 install = { cmd = "pip install -e .", description = "Install alakazam in editable mode" }
 setup = { depends-on = ["build-boa", "install"], description = "Build boa and install alakazam" }
 run = { cmd = "alakazam run", description = "Run pipeline (pass config.yaml as argument)" }
 info = { cmd = "alakazam info", description = "Print solution file summary" }
 test = { cmd = "python -c \"from alakazam.solvers.boa_backend import import_boa; boa = import_boa(); print('boa execution space:', boa.execution_space())\"", description = "Test boa import" }
+test-chain = { cmd = "python tests/test_chain.py", description = "End-to-end chain tests on synthetic data" }
+test-boa = { cmd = "ctest --test-dir alakazam/boa/build", description = "Run boa C++ unit tests" }
 
 [dependencies]
 python = ">=3.9"

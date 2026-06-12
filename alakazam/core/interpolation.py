@@ -12,6 +12,7 @@ Developed by Arpan Pal 2026, NRAO / NCRA
 """
 
 from __future__ import annotations
+import warnings
 import numpy as np
 from typing import Optional, List, Dict, Any, Tuple
 import logging
@@ -184,8 +185,12 @@ def interpolate_delay(sol_times, sol_delay, target_times, target_freqs, time_int
         d_interp = d[idx]
 
     # d_interp: (n_tt, n_ant, n_freq_sol, 2)
-    # Average across solution freq bins (delay is same physical quantity per bin)
-    delay_avg = np.mean(d_interp, axis=2)  # (n_tt, n_ant, 2)
+    # Average across solution freq bins (delay is same physical quantity per
+    # bin). nanmean: flagged bins are NaN — use the remaining good bins;
+    # all-NaN slots stay NaN and propagate into flagged Jones.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        delay_avg = np.nanmean(d_interp, axis=2)  # (n_tt, n_ant, 2)
 
     # Reconstruct Jones at every target frequency
     n_ant = delay_avg.shape[1]

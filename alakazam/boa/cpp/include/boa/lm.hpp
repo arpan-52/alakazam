@@ -104,6 +104,20 @@ SolverResult solve_lm(Problem& prob, const SolverOptions& opts,
             continue;
         }
 
+        // Parameter-step (xtol) convergence: at an optimum with a nonzero
+        // residual floor (unmodelled terms in the data), the gradient is
+        // zero, delta ~ 0, and every trial step is rejected — without this
+        // check the loop would burn max_iter and report false non-convergence.
+        // Kept deliberately tight (1e-12): weakly-constrained directions
+        // (e.g. the free ref-antenna d_qp in the D solver) legitimately
+        // converge through many small steps and must not be cut short.
+        const real_type delta_norm  = std::sqrt(KokkosBlas::dot(delta, delta));
+        const real_type params_norm = std::sqrt(KokkosBlas::dot(params, params));
+        if (delta_norm <= 1.0e-12 * (params_norm + 1.0e-12)) {
+            converged = true;
+            break;
+        }
+
         // Trial step: p_trial = params + delta.
         Kokkos::deep_copy(p_trial, params);
         KokkosBlas::axpy(real_type(1.0), delta, p_trial);

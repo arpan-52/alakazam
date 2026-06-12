@@ -32,7 +32,7 @@ class ParallelDelaySolver(JonesSolver):
         logger.debug(f"K solve: n_ant={n_ant} n_bl={vis_obs.shape[0]} "
                      f"n_freq={vis_obs.shape[1]} backend={self.backend}")
 
-        delay_init, vis_obs_w, vis_mod_w = self._initial_estimate(
+        delay_init = self._initial_estimate(
             vis_obs, vis_model, ant1, ant2, freqs, n_ant)
 
         from .boa_backend import (import_boa, vis22f_to_boa, make_opts,
@@ -69,41 +69,9 @@ class ParallelDelaySolver(JonesSolver):
 
     def _initial_estimate(self, vis_obs, vis_model, ant1, ant2, freqs, n_ant):
         """FFT fringe fitting + BFS propagation for initial delay guess."""
-        n_bl, n_freq = vis_obs.shape[:2]
-        nfft = n_freq * 4
-        df = freqs[1] - freqs[0]
-        delay_axis = np.fft.fftfreq(nfft, d=df)
-        vis_obs_w = vis_obs.copy()
-        vis_mod_w = vis_model.copy()
-
-        for pol in range(2):
-            xsp = vis_obs[:, :, pol, pol] * np.conj(vis_model[:, :, pol, pol])
-            bad = np.abs(vis_model[:, :, pol, pol]) < 1e-30
-            xsp[bad] = 0.0
-            n_good = (~bad).sum(axis=1).astype(np.float64)
-
-            spectra = np.fft.fft(xsp, n=nfft, axis=1)
-            peak_idx = np.argmax(np.abs(spectra), axis=1)
-            tau_best = -delay_axis[peak_idx]
-
-            derot_phase = (2.0 * np.pi * tau_best[:, np.newaxis]
-                           * freqs[np.newaxis, :])
-            xsp_d = xsp * np.exp(1j * derot_phase)
-
-            phi_res = np.angle(xsp_d)
-            phi_res[bad] = 0.0
-            rms_sq = np.sum(phi_res ** 2, axis=1) / np.maximum(n_good, 1.0)
-
-            noise_floor = float(np.median(rms_sq)) * 0.1 + 1e-4
-            weight = 1.0 / (rms_sq + noise_floor)
-            w_sqrt = np.sqrt(weight / weight.max())
-
-            vis_obs_w[:, :, pol, pol] *= w_sqrt[:, np.newaxis]
-            vis_mod_w[:, :, pol, pol] *= w_sqrt[:, np.newaxis]
-
         adj = build_antenna_graph(ant1, ant2, n_ant)
         order = bfs_order(adj, self.ref_ant)
-        bl_delay = _bl_delay_fft(vis_obs_w, vis_mod_w, ant1, ant2, freqs)
+        bl_delay = _bl_delay_fft(vis_obs, vis_model, ant1, ant2, freqs)
         delay = np.zeros((n_ant, 2), dtype=np.float64)
         solved = np.zeros(n_ant, dtype=bool)
         solved[self.ref_ant] = True
@@ -122,7 +90,7 @@ class ParallelDelaySolver(JonesSolver):
                     break
 
         delay[self.ref_ant, :] = 0.0
-        return delay, vis_obs_w, vis_mod_w
+        return delay
 
 
 def _bl_delay_fft(vis_obs, vis_model, ant1, ant2, freqs):
@@ -150,8 +118,29 @@ def _bl_delay_fft(vis_obs, vis_model, ant1, ant2, freqs):
 
         spectra = np.fft.fft(xspec, n=nfft, axis=1)
         peak_idx = np.argmax(np.abs(spectra), axis=1)
+        tau0 = -delay_axis[peak_idx]  # seconds, per baseline
 
-        delays[:, pol] = -delay_axis[peak_idx] * 1e9
+        # The FFT quantum 1/(nfft*df) can be coarser than the 1/nu fringe-lobe
+        # spacing of the absolute-frequency phase model, in which case LM
+        # started from the raw peak converges an integer number of lobes away
+        # from the true delay. Refine with a weighted LS fit of the residual
+        # phase slope; the intercept is left free so a constant per-baseline
+        # phase (e.g. uncalibrated gains) does not bias the slope.
+        xspec_d = xspec * np.exp(2j * np.pi * tau0[:, None] * freqs[None, :])
+        w = np.abs(xspec_d)
+        theta = np.angle(xspec_d)
+        wsum = w.sum(axis=1)
+        ok = wsum > 0
+        nu_bar = (w * freqs[None, :]).sum(axis=1) / np.where(ok, wsum, 1.0)
+        th_bar = (w * theta).sum(axis=1) / np.where(ok, wsum, 1.0)
+        dnu = freqs[None, :] - nu_bar[:, None]
+        denom = (w * dnu ** 2).sum(axis=1)
+        slope = np.where(denom > 0,
+                         (w * dnu * (theta - th_bar[:, None])).sum(axis=1)
+                         / np.where(denom > 0, denom, 1.0), 0.0)
+        tau_refined = tau0 - slope / (2.0 * np.pi)
+
+        delays[:, pol] = tau_refined * 1e9
         delays[good_count < 4, pol] = 0.0
 
     return delays

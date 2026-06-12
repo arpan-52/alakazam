@@ -206,9 +206,9 @@ struct SolverResult {
     view_2d_complex jones;
 
     // Raw parameter vector — canonical output for all solver types.
-    // G: [amp_p, phase_p, amp_q, phase_q] * (n_ant-1)
+    // G: [amp_p, phase_p, amp_q, phase_q] * (n_ant-1) + [amp_p_ref, amp_q_ref]
     // K: [tau_p, tau_q] * (n_ant-1)
-    // D: [Re(d_pq), Im(d_pq), Re(d_qp), Im(d_qp)] * (n_ant-1)
+    // D: [Re(d_pq), Im(d_pq), Re(d_qp), Im(d_qp)] * (n_ant-1) + [Re, Im of d_qp_ref]
     // KC: [tau_ns]   CP: [phi_rad]
     view_1d_real params;
 

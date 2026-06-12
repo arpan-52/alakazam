@@ -30,33 +30,17 @@ logger = logging.getLogger("alakazam")
 
 _boa_device: Optional[str] = None
 
-def detect_device(backend: str, force_gpu: bool = False) -> str:
-    """Detect boa execution space (Kokkos backend).
+def detect_device(backend: str) -> str:
+    """Return the boa Kokkos execution space name.
 
-    Returns 'cuda', 'hip', 'openmp', or 'serial' depending on how
-    Kokkos was compiled. Queries boa once and caches the result.
+    E.g. 'Cuda', 'HIP', 'OpenMP', 'Serial' — determined by how Kokkos
+    was compiled. Queries boa once and caches the result. Raises
+    ImportError if the boa extension is missing (no fallback).
     """
     global _boa_device
-    if _boa_device is not None:
-        return _boa_device
-
-    if backend != "boa":
-        _boa_device = "cpu"
-        return _boa_device
-
-    try:
+    if _boa_device is None:
         from .boa_backend import import_boa
-        boa = import_boa()
-        # If boa exposes execution_space(), use it
-        if hasattr(boa, 'execution_space'):
-            _boa_device = boa.execution_space()
-        else:
-            # Default: assume Kokkos default execution space
-            # GPU builds typically use CUDA/HIP; CPU builds use OpenMP/Serial
-            _boa_device = "kokkos"
-    except ImportError:
-        _boa_device = "cpu"
-
+        _boa_device = import_boa().execution_space()
     return _boa_device
 
 

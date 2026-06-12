@@ -214,6 +214,28 @@ PYBIND11_MODULE(_boa, m)
         "Solve for diagonal gain Jones matrices (G solver).\n"
         "Returns dict: jones (n_ant,4), params, cost, n_iter, converged.");
 
+    m.def("solve_Gp",
+        [](py::array_t<std::complex<double>, py::array::c_style> vis_obs,
+           py::array_t<std::complex<double>, py::array::c_style> vis_model,
+           py::array_t<int, py::array::c_style> ant1,
+           py::array_t<int, py::array::c_style> ant2,
+           py::array_t<double, py::array::c_style> freqs,
+           int n_ant, int ref_ant, const SolverOptions& opts,
+           py::array_t<double, py::array::c_style> init_params) {
+            auto inp = make_input(vis_obs, vis_model, ant1, ant2, freqs, n_ant, ref_ant);
+            if (init_params.size() > 0)
+                inp.init_params = np_to_view_1d_real(init_params, "gp_init");
+            return pack_result(solve_Gp(inp, opts));
+        },
+        py::arg("vis_obs"), py::arg("vis_model"),
+        py::arg("ant1"), py::arg("ant2"), py::arg("freqs"),
+        py::arg("n_ant"), py::arg("ref_ant"),
+        py::arg("opts") = SolverOptions(),
+        py::arg("init_params") = py::array_t<double>(),
+        "Solve for phase-only gain Jones matrices (amps fixed at 1).\n"
+        "Returns dict: jones (n_ant,4), params = [phase_p, phase_q] per non-ref ant,\n"
+        "cost, n_iter, converged.");
+
     m.def("solve_K",
         [](py::array_t<std::complex<double>, py::array::c_style> vis_obs,
            py::array_t<std::complex<double>, py::array::c_style> vis_model,
